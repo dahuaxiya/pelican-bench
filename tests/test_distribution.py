@@ -108,7 +108,7 @@ class DistributionTests(unittest.TestCase):
 
     def test_help_doctor_and_invalid_options(self):
         """帮助与依赖检查不创建数据；显式目录优先，未知参数不启动服务。"""
-        self.assertIn("Usage: pelican-bench", self.command("--help").stdout)
+        self.assertIn("usage: pelican-bench", self.command("--help").stdout)
         version = json.loads((ROOT / "package.json").read_text())["version"]
         self.assertEqual(self.command("--version").stdout.strip(), version)
         info = self.command("doctor", "--json", "--data-dir", str(self.home / "override"))
@@ -118,6 +118,45 @@ class DistributionTests(unittest.TestCase):
         self.assertFalse((self.home / "override").exists())
         self.assertNotEqual(self.command("--unknown").returncode, 0)
         self.assertNotEqual(self.command("--port", "65536").returncode, 0)
+        self.assertIn("--target", self.command("test", "performance", "--help").stdout)
+        self.assertNotIn("setup-iq", self.command("test", "performance", "--help").stdout)
+        self.assertEqual(json.loads(self.command("status", "--json").stdout)["state"], "stopped")
+        self.assertFalse(self.data.exists())
+
+    def test_background_control_and_private_stop(self):
+        """后台服务校验身份和停机令牌；重复启动复用，重启更换身份，状态查询不泄露令牌。"""
+        launched = self.command("start", "--background", "--port", "0", "--no-browser", "--json")
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        self.addCleanup(self.command, "stop")
+        url = json.loads(launched.stdout)["url"].split("/#")[0]
+        metadata = json.loads((self.data / "runtime.json").read_text())
+        self.assertEqual((self.data / "runtime.json").stat().st_mode & 0o777, 0o600)
+        status = self.command("status", "--json")
+        self.assertEqual(json.loads(status.stdout)["state"], "running")
+        self.assertNotIn(metadata["control_token"], status.stdout)
+        for headers in ({}, {"X-Pelican-Control": "wrong-token"},
+                        {"X-Pelican-Control": metadata["control_token"], "Origin": "https://other.example"}):
+            with self.assertRaises(urllib.error.HTTPError) as failure:
+                self.request(url + "/api/runtime/stop", {}, headers)
+            self.assertEqual(failure.exception.code, 403)
+        with self.assertRaises(urllib.error.HTTPError) as failure:
+            self.request(url + "/api/config", {}, {"X-Pelican-Instance": "old-instance"})
+        self.assertEqual(failure.exception.code, 409)
+        duplicate = self.command("start", "-d", "--port", "0", "--no-browser", "--json")
+        self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+        self.assertEqual(json.loads((self.data / "runtime.json").read_text())["instance"], metadata["instance"])
+        restarted = self.command("restart", "-d", "--port", "0", "--no-browser", "--json")
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        self.assertNotEqual(json.loads((self.data / "runtime.json").read_text())["instance"], metadata["instance"])
+        self.assertEqual(self.command("logs", "--lines", "5").returncode, 0)
+        stopped = self.command("stop", "--json")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertEqual(json.loads(stopped.stdout)["state"], "stopped")
+        self.assertEqual(json.loads(self.command("status", "--json").stdout)["state"], "stopped")
+        # 即使遗留 PID 指向本测试进程，stop 也只核对实例，不向那个 PID 发信号。
+        metadata.update(pid=os.getpid())
+        (self.data / "runtime.json").write_text(json.dumps(metadata))
+        self.assertEqual(self.command("stop").returncode, 0)
 
     @unittest.skipUnless(shutil.which("node") and shutil.which("npm"), "npm channel requires Node.js")
     def test_npm_install_and_cross_channel_single_instance(self):
@@ -163,6 +202,8 @@ class DistributionTests(unittest.TestCase):
     def test_local_model_history_and_single_instance(self):
         """模拟一次流式测速，验证请求来自回环、历史可恢复且重复启动不另起服务。"""
         requests = []
+        entered, release = threading.Event(), threading.Event()
+        release.set()
 
         class Model(BaseHTTPRequestHandler):
             """只提供测试需要的模型目录与固定 SSE，不转发到任何远程服务。"""
@@ -181,6 +222,8 @@ class DistributionTests(unittest.TestCase):
                 """提供足够长度的流式正文与真实测试用量，覆盖吞吐计算路径。"""
                 requests.append((self.client_address[0], self.headers.get("Authorization")))
                 self.rfile.read(int(self.headers["Content-Length"]))
+                entered.set()
+                release.wait(timeout=15)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
@@ -208,6 +251,15 @@ class DistributionTests(unittest.TestCase):
                               "base_url": f"http://127.0.0.1:{model.server_port}/v1", "api_key": "local-test-secret"}]},
                               {"Origin": base})
         self.assertNotIn("local-test-secret", json.dumps(config))
+        # CLI 定点修改不能覆盖网页保存的提示词、预算或其他站点密钥。
+        before = self.request(base + "/api/config")
+        changed = self.command("sites", "set", "mock-site", "--model", "mock-model", "--json")
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        after = self.request(base + "/api/config")
+        self.assertEqual(before["prompt"], after["prompt"])
+        self.assertEqual(before["iq_auto_review_model"], after["iq_auto_review_model"])
+        self.assertTrue(next(s for s in json.loads(changed.stdout)["sites"] if s["name"] == "mock-site")["has_key"])
+        self.assertIn("mock-model", self.command("models", "--site", "mock-site", "--json").stdout)
         repeated = self.command("--port", "0", "--no-browser")
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertIn("Already running:", repeated.stdout)
@@ -215,23 +267,47 @@ class DistributionTests(unittest.TestCase):
         collision = self.command("--port", str(state["port"]), "--data-dir", str(self.home / "other"), "--no-browser")
         self.assertNotEqual(collision.returncode, 0)
         self.assertIn("Port is already in use", collision.stderr)
-        self.request(base + "/api/probe", {"mode": "performance", "targets": [{"site": "mock-site", "model": "mock-model"}],
-                     "concurrency": 2}, {"Origin": base})
-        result = {}
-        for _ in range(200):
-            result = self.request(base + "/api/probe")
-            if result.get("status") == "completed":
-                break
-            time.sleep(.05)
+        measured = self.command("test", "performance", "--site", "mock-site", "--all-models",
+                                "--concurrency", "2", "--json")
+        self.assertEqual(measured.returncode, 0, measured.stderr)
+        result = json.loads(measured.stdout)
+        self.assertIn(result["id"], measured.stderr)
         self.assertEqual(result.get("status"), "completed", result)
         self.assertEqual(result["rows"][0]["status"], "success", result)
         self.assertEqual(result["rows"][0]["metrics"]["output_tokens"], 400)
         self.assertEqual(requests, [("127.0.0.1", "Bearer local-test-secret")])
         self.assertEqual((self.data / "config.json").stat().st_mode & 0o777, 0o600)
+        queried = self.command("results", "performance", result["id"], "--json")
+        self.assertEqual(json.loads(queried.stdout)["id"], result["id"])
+        # 明确选择正在运行的新批次；第二次提交不能拿另一个批次冒充本次结果。
+        entered.clear()
+        release.clear()
+        self.addCleanup(release.set)
+        pending = self.command("test", "capacity", "--target", "mock-site", "mock-model", "--no-wait", "--json")
+        self.assertEqual(pending.returncode, 0, pending.stderr)
+        pending_id = json.loads(pending.stdout)["id"]
+        self.assertTrue(entered.wait(5))
+        rejected = self.command("test", "performance", "--site", "mock-site", "--model", "mock-model", "--no-wait")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotEqual(self.command("stop").returncode, 0)
+        self.assertNotEqual(self.command("cancel", "capacity", result["id"]).returncode, 0)
+        waiting = self.command("results", "capacity", pending_id, "--watch", "--wait-timeout", "1", "--json")
+        self.assertEqual(waiting.returncode, 4, waiting.stderr)
+        self.assertEqual(self.request(base + "/api/probe")["status"], "running")
+        cancelled = self.command("cancel", "capacity", pending_id, "--json")
+        self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
+        release.set()
+        finished = self.command("results", "capacity", pending_id, "--watch", "--json")
+        self.assertEqual(finished.returncode, 3, finished.stderr)
+        self.assertEqual(json.loads(finished.stdout)["status"], "cancelled")
+        # 更新为不同 URL 时不把原 key 跟过去，别的配置与历史仍保留。
+        moved = self.command("sites", "set", "mock-site", "--base-url", f"http://127.0.0.1:{model.server_port}/other", "--json")
+        self.assertEqual(moved.returncode, 0, moved.stderr)
+        self.assertFalse(next(s for s in json.loads(moved.stdout)["sites"] if s["name"] == "mock-site")["has_key"])
         self.stop(process)
         _, base, new_state = self.launch()
         self.assertNotEqual(new_state["instance"], state["instance"])
-        self.assertEqual(self.request(base + "/api/probe/history")["total"], 1)
+        self.assertEqual(self.request(base + "/api/probe/history")["total"], 2)
         self.assertEqual(self.request(base + "/api/probe/compare")["total"], 1)
         for name in ("config.json", ".local", "iq-runs", "__pycache__"):
             self.assertFalse((ROOT / name).exists(), f"Install tree must remain clean: {name}")

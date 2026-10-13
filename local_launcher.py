@@ -1,12 +1,12 @@
-"""npm 分发用的本机启动入口；管理实例锁和可选依赖，不处理模型凭据。"""
+"""Brew/npm 共用入口；管理本机实例、可选依赖和 CLI 请求。"""
 from __future__ import annotations
 
-import argparse
 import errno
 import json
 import os
 from pathlib import Path
 import shutil
+import secrets
 import signal
 import subprocess
 import sys
@@ -16,6 +16,7 @@ import uuid
 import webbrowser
 
 from runtime_paths import CODE_DIR, DATA_DIR
+import cli_commands as cli
 
 
 class InstanceLock:
@@ -46,17 +47,22 @@ class InstanceLock:
             raise
 
     def write(self, value):
-        """仅锁持有者写公开实例信息；在端口就绪前不会对外声明实例可用。
+        """仅锁持有者写私有实例信息；在端口就绪前不会对外声明实例可用。
 
         Args:
-            value: 只包含状态、PID、回环端口和随机实例 ID 的字典。
+            value: 状态、PID、端口、实例 ID 和仅限本机 CLI 使用的控制令牌。
         """
         if not self.acquired:
             raise RuntimeError("Instance lock not held")
         # Windows 字节锁会阻止其他进程读取被锁字节。元数据单独原子替换，
         # 既能在持锁期间供重复启动读取，也不会暴露写到一半的 JSON。
         temporary = DATA_DIR / "runtime.json.tmp"
-        temporary.write_text(json.dumps(value), encoding="utf-8")
+        # stop 的控制令牌不能由网页读取，临时文件和最终文件均仅用户可读。
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+            if os.name != "nt":
+                os.fchmod(target.fileno(), 0o600)
+            json.dump(value, target)
         temporary.replace(DATA_DIR / "runtime.json")
 
     def existing(self):
@@ -121,29 +127,120 @@ def interrupted(_signum, _frame):
     raise KeyboardInterrupt
 
 
+def background(port=8780):
+    """启动脱离终端的本机子进程；只在随机实例校验通过后返回，不使用 PID 猜测身份。"""
+    existing = cli.discover()
+    if existing:
+        return existing
+    DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(DATA_DIR / "server.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS} if os.name == "nt" else {"start_new_session": True}
+    with os.fdopen(descriptor, "ab") as log:
+        child = subprocess.Popen([sys.executable, "-B", "-u", str(CODE_DIR / "local_launcher.py"),
+                                  "start", "--port", str(port), "--no-browser"],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 cwd=CODE_DIR, close_fds=True, **options)
+    deadline = time.monotonic() + 60
+    try:
+        while time.monotonic() < deadline:
+            live = cli.discover()
+            if live:
+                return live
+            if child.poll() is not None:
+                raise ValueError(f"后台启动失败，请运行 pelican-bench logs；日志：{DATA_DIR / 'server.log'}")
+            time.sleep(.1)
+        raise ValueError("服务启动超过 60 秒，请检查 pelican-bench logs")
+    except BaseException:
+        # 只清理本次创建且尚未返回给用户的子进程，不影响锁竞争中获胜的其他实例。
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        raise
+
+
+def stop_server(wait=False, timeout=30):
+    """通过已验证实例的私有控制口停止；忙碌时拒绝或有限等待，不给磁盘 PID 发信号。"""
+    if timeout < 1:
+        raise ValueError("--timeout 必须大于 0")
+    live = cli.discover()
+    if not live:
+        return {"state": "stopped", "message": "本数据目录没有可验证的运行实例"}
+    if not live.metadata.get("control_token"):
+        raise ValueError("旧版实例不支持 stop，请在原启动终端按 Ctrl+C 后重新启动")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            live.request("/api/runtime/stop", {}, timeout=5)
+            break
+        except cli.ApiError as exc:
+            if exc.status != 409 or not wait or time.monotonic() >= deadline:
+                raise
+            time.sleep(.5)
+    # HTTP 断开不代表清理完成，必须等旧锁释放；同时保护可能刚启动的新实例。
+    while time.monotonic() < deadline + 10:
+        lock = InstanceLock()
+        try:
+            if lock.acquire():
+                return {"state": "stopped"}
+        finally:
+            lock.close()
+        current = cli.discover()
+        if current and current.metadata["instance"] != live.metadata["instance"]:
+            return {"state": "replaced", "message": "原实例已停止，另一个命令启动了新实例"}
+        time.sleep(.1)
+    raise ValueError("已发停止请求，但服务尚未退出；请检查 status 和 logs")
+
+
 def main():
-    """执行本机命令；启动、题库准备共用目录锁，防止任务运行中替换判分资源。"""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", default="start", choices=("start", "doctor", "setup-iq", "setup-engineering"))
-    parser.add_argument("dataset", nargs="?", choices=("bbeh", "arc"))
-    parser.add_argument("--port", type=int, default=8780)
-    parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument("--json", action="store_true")
-    parser.add_argument("--archive", type=Path)
-    parser.add_argument("--parquet", type=Path)
-    args = parser.parse_args()
-    if not 0 <= args.port <= 65535:
+    """分发 CLI；只有持有目录锁的服务/安装器能写运行状态，查询不会另起执行器。"""
+    parser = cli.parser()
+    arguments = sys.argv[1:]
+    if not arguments or (arguments[0].startswith("-") and arguments[0] not in ("--help", "-h")):
+        arguments = ["start", *arguments]
+    args = parser.parse_args(arguments)
+    if not 0 <= getattr(args, "port", 0) <= 65535:
         parser.error("port must be between 0 and 65535")
-    if args.command == "setup-iq" and not args.dataset:
-        parser.error("setup-iq requires bbeh or arc")
-    if args.dataset and args.command != "setup-iq":
-        parser.error("dataset only applies to setup-iq")
+    if getattr(args, "wait_timeout", 0) < 0:
+        parser.error("--wait-timeout 不能小于 0")
+    if getattr(args, "json", False) and args.command in ("start", "restart") and not args.background:
+        parser.error("start/restart --json 需要 --background，避免服务日志混入 JSON")
     if args.command == "doctor":
-        result = doctor()
-        print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else "\n".join(f"{key}: {value}" for key, value in result.items()))
+        cli.emit(doctor(), args.json)
+        return
+    if args.command == "status":
+        live = cli.discover()
+        state = live.request("/api/runtime/status") if live else {"state": "stopped"}
+        cli.emit({**state, "data_directory": str(DATA_DIR), **({"url": live.url} if live else {})}, args.json)
+        return
+    if args.command == "logs":
+        cli.logs(args.lines, args.follow)
         return
     # 不修改 HOME/CODEX_HOME 等用户设置，只为本应用新文件收紧 POSIX 默认权限。
     os.umask(0o077)
+    if args.command in ("stop", "restart"):
+        stopped = stop_server(getattr(args, "wait", False), getattr(args, "timeout", 30))
+        if args.command == "stop":
+            cli.emit(stopped, args.json)
+            return
+        args.command = "start"
+    if args.command == "open" or (args.command == "start" and args.background):
+        live = background(getattr(args, "port", 8780))
+        page = getattr(args, "page", "performance")
+        url = live.url + ("/static/engineering.html" if page == "engineering" else "/#" + page)
+        if not getattr(args, "no_browser", False):
+            webbrowser.open(url)
+        cli.emit({"state": "running", "url": url, "log": str(DATA_DIR / "server.log")}, getattr(args, "json", False))
+        return
+    if args.command not in ("start", "setup-iq", "setup-engineering"):
+        live = cli.discover()
+        if not live:
+            print("正在后台启动本机服务…", file=sys.stderr)
+            live = background()
+        return cli.execute(args, live)
     lock = InstanceLock()
     try:
         if not lock.acquire():
@@ -165,25 +262,30 @@ def main():
         import app
         signal.signal(signal.SIGTERM, interrupted)
         instance = uuid.uuid4().hex
+        control_token = secrets.token_urlsafe(32)
 
         def ready(url):
             """记录已经绑定的实际端口，随后才允许重复启动复用并打开页面。"""
             from urllib.parse import urlparse
-            lock.write({"pid": os.getpid(), "state": "running", "port": urlparse(url).port, "instance": instance})
+            lock.write({"pid": os.getpid(), "state": "running", "port": urlparse(url).port,
+                        "instance": instance, "control_token": control_token})
             print(f"Data: {DATA_DIR}\nOpen: {url}#performance", flush=True)
             if not args.no_browser:
                 webbrowser.open(url + "#performance")
 
-        app.main(["--port", str(args.port), "--no-browser"], on_listening=ready, instance_id=instance)
+        app.main(["--port", str(args.port), "--no-browser"], on_listening=ready,
+                 instance_id=instance, control_token=control_token)
     finally:
+        if lock.acquired:
+            lock.write({"state": "stopped"})
         lock.close()
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except KeyboardInterrupt:
-        pass
+        sys.exit(130)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         if isinstance(error, OSError) and error.errno == errno.EADDRINUSE:
             print("Port is already in use. Keep the existing server, or choose --port <number>.", file=sys.stderr)

@@ -16,6 +16,7 @@ import argparse
 import json
 import mimetypes
 import os
+import secrets
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -129,9 +130,13 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- 路由 ----------
 
     def do_GET(self) -> None:  # noqa: N802
-        """处理 GET；评测历史按固定 ID 访问，工程数据不包含参考补丁或凭据。"""
+        """处理 GET；CLI 请求核对实例，评测历史按固定 ID 访问，不含凭据。"""
         if not self._host_ok():
             self._json({"error": "只允许通过 127.0.0.1 访问"}, 403)
+            return
+        instance = self.headers.get("X-Pelican-Instance")
+        if instance and instance != getattr(self.server, "instance_id", None):
+            self._json({"error": "服务实例已变化，请重新执行命令"}, 409)
             return
         parsed = urlparse(self.path)
         path = parsed.path
@@ -157,6 +162,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/config":
                 # 只回掩码后的配置，明文 key 不出进程。
                 self._json(config.public_config(config.load()))
+            elif path == "/api/runtime/status":
+                self._json({"state": "stopping" if getattr(self.server, "stopping", False) else "running",
+                            "busy": _evaluation_busy()})
             elif path == "/api/models":
                 self._api_models(query)
             elif path == "/api/chatgpt/status":
@@ -227,13 +235,20 @@ class Handler(BaseHTTPRequestHandler):
             self._dispatch_post()
 
     def _dispatch_post(self) -> None:
-        """分发固定 POST 路由；模型、账号和设置操作均验证同源 JSON 请求。"""
+        """在共享操作锁内核对实例、同源和停机状态，避免检查空闲后又创建任务。"""
         if not self._host_ok():
             self._json({"error": "只允许通过 127.0.0.1 访问"}, 403)
             return
         path = urlparse(self.path).path
         try:
-            if path in ("/api/run", "/api/config", "/api/probe", "/api/probe/cancel") or path.startswith(("/api/chatgpt/", "/api/kimi/")):
+            instance = self.headers.get("X-Pelican-Instance")
+            if instance and instance != getattr(self.server, "instance_id", None):
+                self._json({"error": "服务实例已变化，请重新执行命令"}, 409)
+                return
+            if getattr(self.server, "stopping", False):
+                self._json({"error": "服务正在停止，不再接受操作"}, 503)
+                return
+            if path in ("/api/run", "/api/config", "/api/probe", "/api/probe/cancel", "/api/cli/site", "/api/runtime/stop") or path.startswith(("/api/chatgpt/", "/api/kimi/")):
                 # SVG 与设置同样可触发账号用量或改变路由，不能允许第三方网页借本机登录态代发。
                 origin = self.headers.get("Origin")
                 if origin and origin != "http://" + self.headers.get("Host", ""):
@@ -242,17 +257,41 @@ class Handler(BaseHTTPRequestHandler):
                 if self.headers.get_content_type() != "application/json":
                     self._json({"error": "需要 application/json 请求"}, 415)
                     return
+            if path == "/api/runtime/stop":
+                token = getattr(self.server, "control_token", None)
+                supplied = self.headers.get("X-Pelican-Control", "")
+                if not token or not secrets.compare_digest(token, supplied):
+                    self._json({"error": "仅允许本机 CLI 停止当前实例"}, 403)
+                    return
+                if _evaluation_busy():
+                    self._json({"error": "仍有评测或复核运行中；先 cancel 对应批次，或 stop --wait --timeout 600"}, 409)
+                    return
+                self.server.stopping = True
+                self._json({"state": "stopping"})
+                # shutdown 必须在 serve_forever 以外的线程执行；先阻止新任务，再停止监听。
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+            if path == "/api/cli/site":
+                self._api_cli_site()
+                return
             if getattr(self.server, "engineering_port", None) and path.startswith("/api/swe/"):
                 # 不转发带副作用的请求或绕过原服务的同源检查，请到持有任务的页面操作。
                 self._json({"error": "工程任务由原服务管理，请从工程评测入口进入后操作"}, 409)
                 return
             if path in ("/api/probe", "/api/probe/cancel", "/api/chatgpt/probe", "/api/chatgpt/probe/cancel"):
                 data = self._read_json()
-                if not isinstance(data, dict) or set(data) - ({"site", "model", "mode", "targets", "concurrency"} if path.endswith("/probe") else set()):
+                if not isinstance(data, dict) or set(data) - ({"site", "model", "mode", "targets", "concurrency", "require_new"} if path.endswith("/probe") else {"run_id"}):
                     raise ValueError("测试参数不受支持，请刷新页面后重试")
                 if path.endswith("/cancel"):
+                    # CLI 按明确 ID 取消；网页旧请求仍允许取消当前任务。
+                    if "run_id" in data and data["run_id"] != codex_probe.manager.snapshot().get("id"):
+                        self._json({"error": "该批次不是当前任务，未取消其他测试"}, 409)
+                        return
                     result = codex_probe.manager.cancel()
                 elif "targets" in data:
+                    if data.get("require_new") and codex_probe.manager.busy():
+                        self._json({"error": "已有测速或容量检测运行中，请等待或取消该批次"}, 409)
+                        return
                     # 批量与旧版单项参数必须互斥，避免界面与后端对实际测试范围理解不同。
                     if "site" in data or "model" in data:
                         raise ValueError("批量测试不能同时指定单项站点或模型")
@@ -307,6 +346,44 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
 
     # ---------- 具体处理 ----------
+
+    def _api_cli_site(self):
+        """仅更新指定普通站点，锁内读取最新配置，保留其他站点、提示词和复核设置。"""
+        import official_channels
+        data = self._read_json()
+        if set(data) - {"action", "name", "base_url", "api_key", "models"}:
+            raise ValueError("不支持的站点字段")
+        name, action = data.get("name"), data.get("action")
+        if not isinstance(name, str) or not name.strip() or action not in ("set", "remove"):
+            raise ValueError("需要有效站点名和 set/remove 操作")
+        name = name.strip()
+        if official_channels.reserved({"name": name, "base_url": data.get("base_url")}):
+            raise ValueError("内置账号渠道请在设置页登录，不能通过普通站点配置替换")
+        with config._LOCK:
+            cfg = config.load()
+            old = next((s for s in cfg["sites"] if s["name"] == name), None)
+            if action == "remove":
+                if old is None:
+                    raise ValueError("站点不存在")
+                cfg["sites"] = [s for s in cfg["sites"] if s["name"] != name]
+            else:
+                site = {**(old or {}), **{k: v for k, v in data.items() if k not in ("action", "name")}, "name": name}
+                parsed = urlparse(str(site.get("base_url", "")))
+                if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                    raise ValueError("base-url 需要不含凭据、查询参数或片段的 HTTP(S) 地址")
+                # 更换路由时不能把旧站点密钥静默发送到新地址；显式传入新 key 才保留。
+                if old and site["base_url"].rstrip("/") != old["base_url"].rstrip("/") and "api_key" not in data:
+                    site["api_key"] = ""
+                if "models" in data and (not isinstance(data["models"], list) or any(not isinstance(m, str) or not m.strip() for m in data["models"])):
+                    raise ValueError("models 必须是非空模型名组成的数组")
+                if "api_key" in data and (not isinstance(data["api_key"], str) or len(data["api_key"]) > 65536):
+                    raise ValueError("api_key 必须为字符串，最多 64 KiB")
+                normal = config._normalise_site(site)
+                cfg["sites"] = [normal if s["name"] == name else s for s in cfg["sites"]]
+                if old is None:
+                    cfg["sites"].append(normal)
+            config.save(cfg)
+            self._json({"sites": config.public_config(cfg)["sites"]})
 
     def _api_iq_post(self, path: str) -> None:
         """处理评测和复核设置，拒绝跨源网页或表单代发请求。
@@ -519,13 +596,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def main(argv=None, on_listening=None, instance_id=None) -> None:
+def main(argv=None, on_listening=None, instance_id=None, control_token=None) -> None:
     """绑定回环端口后恢复历史再提供服务，供源码入口及 npm 启动器共用。
 
     Args:
         argv: 命令行参数列表；None 时读取进程参数，端口 0 由系统分配。
         on_listening: 可选回调，端口绑定且恢复完成后接收实际首页 URL。
         instance_id: 启动器生成的实例标识，仅用于识别本机服务，不是认证令牌。
+        control_token: 启动器保存在私有文件的随机停机令牌；原始 app.py 入口不提供 CLI 停机。
     """
     parser = argparse.ArgumentParser(description="鹈鹕骑自行车 · 多站点多模型跑批")
     parser.add_argument("--port", type=int, default=8777, help="监听端口，默认 8777")
@@ -548,6 +626,8 @@ def main(argv=None, on_listening=None, instance_id=None) -> None:
     # 留一个能绑 0.0.0.0 的开关就等于给自己留个泄露入口。
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.instance_id = instance_id
+    server.control_token = control_token
+    server.stopping = False
     codex_probe.manager.restore_history()
     server.engineering_port = args.engineering_port
     url = f"http://127.0.0.1:{server.server_port}/"

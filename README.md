@@ -30,11 +30,81 @@ pelican-bench --data-dir ./my-bench-data
 也保留 npm 安装入口，需要 Node.js 20+ 和 Python 3.10+。npm 注册表尚未发布，请使用 GitHub Release 提供的安装包：
 
 ```sh
-npm install -g ./pelican-bench-0.2.0.tgz
+npm install -g ./pelican-bench-0.3.0.tgz
 pelican-bench
 ```
 
 Homebrew 直接调用 Python，npm 通过 Node 启动同一个 Python 后端。两种入口共用用户数据目录和实例锁，切换渠道不需要迁移成绩。请选择一种全局安装方式，避免两个包管理器争用同名命令。
+
+## 服务命令
+
+~~~sh
+pelican-bench start                        # 前台启动并打开网页，与不带参数相同
+pelican-bench start -d --no-browser        # 后台启动，关闭终端也继续运行
+pelican-bench status                      # 查看是否运行、是否有在途任务
+pelican-bench open performance            # 打开测速页；也支持 iq、settings、engineering
+pelican-bench logs --lines 50
+pelican-bench logs -f                     # 持续查看后台日志
+pelican-bench stop                        # 停止空闲服务
+pelican-bench stop --wait --timeout 600    # 等任务完成后停止，最多等 600 秒
+pelican-bench restart -d --no-browser      # 重启空闲服务
+~~~
+
+stop 和 restart 只操作当前数据目录的实例。还有测评或复核时默认拒绝停止；可先用 cancel 停止指定批次。等待超时不会强杀进程。旧版已启动的服务需要先在原终端按 Ctrl+C，再用新命令启动。
+
+--data-dir 可放在任意子命令后；自定义目录的启动、查询、停止要使用同一个目录。后台日志在该目录的 server.log。status 和 doctor 不启动服务；配置、查询结果或发起测试时，若没有运行实例，会后台启动一个。默认端口被其他程序占用时，先用 start -d --port 9000 指定空闲端口。
+
+## 直接用 CLI 测试
+
+第一次使用，可以在网页设置站点，也可以用命令配置：
+
+~~~sh
+pelican-bench sites list
+# MODEL_API_KEY 是自己设置的环境变量名，命令不回显密钥。
+pelican-bench sites set my-api --base-url https://example.com/v1 --api-key-env MODEL_API_KEY
+pelican-bench models --site my-api
+# 接口不提供 /models 时，显式配置候选模型，可重复传入 --model。
+pelican-bench sites set my-api --model gpt-6.1-sol
+~~~
+
+也可用 --api-key-stdin 从标准输入接收密钥。修改单个站点保留其他配置；更换地址且未提供新密钥时清除旧密钥。内置 ChatGPT、Kimi 渠道请在设置页登录；CLI 使用 sites list 中的同一站点名。sites remove NAME 删除普通站点配置，不删除历史成绩。
+
+~~~sh
+# 单个模型测速，终端显示进度和结果
+pelican-bench test performance --site my-api --model gpt-6.1-sol
+
+# 同一站点全部模型并发测
+pelican-bench test performance --site my-api --all-models --concurrency 32
+
+# 多个站点、模型的明确组合
+pelican-bench test performance --target my-api gpt-6.1-sol --target another-api other-model
+
+# 容量检测
+pelican-bench test capacity --site my-api --model gpt-6.1-sol
+
+# IQ 默认先跑 23 题；正式测评选 bbeh-mini，需要先安装题库
+pelican-bench test iq --site my-api --model gpt-6.1-sol --suite bbeh-smoke --concurrency 32
+
+# SVG 使用网页保存的提示词和预算；工程评测需要先准备 Docker 和数据
+pelican-bench test svg --site my-api --model gpt-6.1-sol
+pelican-bench test engineering --site my-api --model gpt-6.1-sol --suite smoke
+~~~
+
+测试从当前电脑发出，可能使用模型额度。--site 和 --model 都可重复，组合测试；--target 指定精确组合，不能与它们混用。测速、容量和 IQ 并发可设为 1 到 200；默认沿用网页配置规则。
+
+默认等待测试结束，IQ 还会等待原批次自动重试和自动复核。复核模型在网页设置；不可用或复核失败时显示未完成状态，不把临时分当最终分。--no-wait 提交后立即返回批次 ID；Ctrl+C 或 --wait-timeout 只停止 CLI 等待，不取消后台任务。
+
+~~~sh
+pelican-bench results performance                 # 历史批次列表（包含容量检测）
+pelican-bench results performance RUN_ID --watch # 持续查看指定批次
+pelican-bench results iq RUN_ID --full --json     # 完整题目与回答
+pelican-bench cancel performance RUN_ID          # 也支持 capacity、iq、engineering
+pelican-bench retry iq RUN_ID                    # 原地重试接口失败项
+pelican-bench test performance --site my-api --model gpt-6.1-sol --json > result.json
+pelican-bench test iq --help
+~~~
+
+SVG 目前不支持单独取消，等待完成后再 stop。网页与 CLI 共用历史；--json 的标准输出只包含 JSON，进度写到 stderr。退出码：0 为命令成功；1 为连接或操作失败；2 为参数错误；3 为测评、取消或复核未完整成功；4 为等待超时；130 为用户中断等待。模型答错、工程题未修复属于测评结果，不会仅因此返回非零码。
 
 ## 数据与升级
 

@@ -42,25 +42,7 @@ function main() {
     console.log(JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version);
     return;
   }
-  if (args.includes('--help') || args.includes('-h')) {
-    console.log(`Pelican Bench - local model benchmarks
-
-Usage: pelican-bench [start|doctor|setup-iq|setup-engineering] [options]
-  start                       Open the local web UI (default)
-  doctor [--json]             Check local dependencies without calling models
-  setup-iq bbeh|arc            Download a pinned official question set
-  setup-engineering           Install optional Python environment and SWE data
-  --data-dir <path>            Keep config, accounts and results in this directory
-  --python <path>              Select Python 3.10+ (3.11+ for engineering)
-  --port <number>              Local port, default 8780; 0 selects a free port
-  --no-browser                Do not open a browser
-  --archive <path>             Use a local official archive with setup-iq
-  --parquet <path>             Use local SWE data with setup-engineering
-
-Requires Node.js 20+ and Python 3.10+. Model requests run on this computer.
-Set PELICAN_BENCH_DOCKER_CONTEXT to select an engineering Docker context.`);
-    return;
-  }
+  // 子命令帮助交给同一个 Python parser，避免 Brew/npm 的选项和行为分叉。
   const explicitPython = option('--python') || process.env.PELICAN_BENCH_PYTHON;
   const data = path.resolve(option('--data-dir') || process.env.PELICAN_BENCH_DATA_DIR || dataDirectory());
   const python = pythonCommand(explicitPython);
