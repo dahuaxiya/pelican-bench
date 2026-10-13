@@ -44,10 +44,15 @@ class DistributionTests(unittest.TestCase):
         """启动本次测试的服务并核对随机实例 ID，返回前确保 HTTP 已经就绪。"""
         log = open(self.home / "server.log", "ab")
         self.addCleanup(log.close)
-        process = subprocess.Popen([sys.executable, "-u", str(ENTRY), "--port", "0", "--no-browser"],
+        # CI 冷启动较慢时保留线程栈，区分解释器导入与 HTTP 未就绪，避免只得到空日志。
+        bootstrap = ("import faulthandler,runpy,sys; "
+                     "faulthandler.dump_traceback_later(30,repeat=True); "
+                     "entry=sys.argv.pop(1); runpy.run_path(entry,run_name='__main__')")
+        process = subprocess.Popen([sys.executable, "-u", "-c", bootstrap, str(ENTRY), "--port", "0", "--no-browser"],
                                    cwd=self.home, env=self.env, stdout=log, stderr=log)
         self.addCleanup(self.stop, process)
-        for _ in range(200):
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
             if process.poll() is not None:
                 self.fail((self.home / "server.log").read_text())
             try:
@@ -94,7 +99,8 @@ class DistributionTests(unittest.TestCase):
     def test_help_doctor_and_invalid_options(self):
         """帮助与依赖检查不创建数据；显式目录优先，未知参数不启动服务。"""
         self.assertIn("Usage: pelican", self.command("--help").stdout)
-        self.assertEqual(self.command("--version").stdout.strip(), "pelican-bench 0.1.0")
+        version = json.loads((ROOT / "package.json").read_text())["version"]
+        self.assertEqual(self.command("--version").stdout.strip(), "pelican-bench " + version)
         info = self.command("doctor", "--json", "--data-dir", str(self.home / "override"))
         self.assertEqual(info.returncode, 0, info.stderr)
         self.assertEqual(json.loads(info.stdout)["data_directory"], str(self.home / "override"))

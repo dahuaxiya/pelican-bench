@@ -1,6 +1,6 @@
 {
   "name": "pelican-bench",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Benchmark model endpoints from your own computer with a local web UI.",
   "license": "MIT",
   "engines": { "node": ">=20" },

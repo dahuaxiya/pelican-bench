@@ -13,6 +13,8 @@ pelican
 
 Homebrew 自动安装 Python，不需要 npm、uv 或手动准备 Python 环境。这里使用项目维护的 Tap，不是 Homebrew Core 收录。
 
+0.1.1 起提供 pelican 命令，同时保留旧版 pelican-bench 命令。两者使用相同的数据目录与实例锁。
+
 启动后自动打开本地网页，默认端口 8780。在设置中填写自己的模型地址和凭据，再选择模型开始测试。
 
 ```sh
