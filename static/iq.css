@@ -70,7 +70,7 @@
 .iq-view-toggle button[aria-pressed="true"] { color: var(--page-blue); background: var(--page-surface); border-color: var(--page-border); }
 .iq-accuracy-track { min-width: 0; height: 20px; overflow: hidden; border-radius: 4px; background: var(--page-inset); }
 .iq-accuracy-fill { display: block; height: 100%; background: var(--positive, #08745a); border-radius: 0 4px 4px 0; }
-.iq-bar-axis, .iq-bar-item { display: grid; grid-template-columns: 36px minmax(150px, 230px) minmax(100px, 1fr) 78px 34px; gap: 18px; align-items: center; }
+.iq-bar-axis, .iq-bar-item { display: grid; grid-template-columns: 36px minmax(150px, 230px) minmax(100px, 1fr) minmax(100px, 1fr) 34px; gap: 18px; align-items: center; }
 .iq-bar-axis { padding: 12px 0; border-bottom: 1px solid var(--page-border); color: var(--page-secondary); font-size: 11px; }
 .iq-bar-scale { display: flex; justify-content: space-between; }
 .iq-bar-item { padding: 18px 0; border-bottom: 1px solid var(--page-border); }
@@ -80,15 +80,27 @@
 .iq-bar-identity small { font-size: 12px; color: var(--page-secondary); }
 .iq-bar-value { font-size: 16px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .iq-bar-item .record-action { width: 34px; height: 34px; min-height: 34px; padding: 0; justify-content: center; }
+.iq-comparison-score { min-width: 0; font-variant-numeric: tabular-nums; }
+.iq-comparison-caption { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 5px; color: var(--page-secondary); font-size: 11px; }
+.iq-comparison-caption small { font-size: 11px; white-space: nowrap; }
+.iq-comparison-score > strong { display: block; font-size: 18px; font-weight: 600; }
+.iq-comparison-score .iq-accuracy-track { height: 10px; margin-top: 8px; }
+.iq-score-before .iq-accuracy-fill { background: var(--page-blue); }
+.iq-score-after > strong { color: var(--positive, #08745a); }
+.iq-comparison-score > .iq-score-pending { font-size: 13px; color: var(--page-secondary); font-weight: 400; }
+.iq-comparison-table .iq-comparison-caption > span { display: none; }
+.iq-rank-latency { display: none; }
 .iq-score-with-bar { min-width: 150px; }
 .iq-score-with-bar .iq-accuracy-track { height: 8px; margin-top: 8px; }
 .iq-index > details { margin-top: 4px; font-size: 11px; font-weight: 400; white-space: normal; }
 @media (max-width: 800px) {
+  .iq-rank-latency { display: block; margin-top: 4px; color: var(--page-secondary); font-size: 10px; font-weight: 400; }
   .iq-bar-axis { display: none; }
-  .iq-bar-item { grid-template-columns: 28px minmax(0, 1fr) 72px 34px; gap: 10px; }
+  .iq-bar-item { grid-template-columns: 24px minmax(0, 1fr) minmax(0, 1fr) 30px; gap: 12px; }
   .iq-bar-rank { grid-column: 1; grid-row: 1 / 3; }
   .iq-bar-identity { grid-column: 2 / 4; grid-row: 1; }
-  .iq-bar-item .iq-accuracy-track { grid-column: 2; grid-row: 2; height: 16px; }
+  .iq-bar-item .iq-score-before { grid-column: 2; grid-row: 2; }
+  .iq-bar-item .iq-score-after { grid-column: 3; grid-row: 2; }
   .iq-bar-value { grid-column: 3; grid-row: 2; font-size: 14px; }
   .iq-bar-item .record-action { grid-column: 4; grid-row: 1 / 3; }
 }

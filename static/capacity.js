@@ -39,11 +39,13 @@
     else { button.prepend(symbol); }
   }
 
-  /** 在当前目录内筛选名称，不更改隐藏模型的选择，不触发网络或打断输入焦点。 */
-  function filterModels() {
-    const rows = [...host.querySelectorAll('.capacity-picker > .capacity-models .capacity-model')];
+  /** 在当前目录内筛选名称，不更改隐藏模型的选择，不触发网络或打断输入焦点。
+   * @param {HTMLElement} root 已挂载区域或尚未挂载的完整控件，用于在替换前完成筛选。
+   */
+  function filterModels(root = host) {
+    const rows = [...root.querySelectorAll('.capacity-picker > .capacity-models .capacity-model')];
     rows.forEach(row => { row.hidden = !row.textContent.toLowerCase().includes(modelFilter.trim().toLowerCase()); });
-    const empty = host.querySelector('.capacity-no-match');
+    const empty = root.querySelector('.capacity-no-match');
     if (empty) { empty.hidden = rows.some(row => !row.hidden) || catalogBusy; }
   }
 
@@ -128,7 +130,7 @@
     return picker;
   }
 
-  /** 只重绘检测区域；历史结果带时间，不能当作持续有效的健康状态。
+  /** 完整构建后一次替换检测区域，避免轮询期间的临时空页面改变滚动位置。
    * @param {string} [error] 已转换为可展示文本的接口错误，不作为 HTML 解析。
    */
   function render(error) {
@@ -140,10 +142,10 @@
     const focusedModel = document.activeElement?.closest('.capacity-model')?.textContent;
     const searchFocused = document.activeElement?.getAttribute('aria-label') === '搜索测试模型';
     const searchPosition = searchFocused ? document.activeElement.selectionStart : null;
-    host.replaceChildren();
     const controls = node('section', null, 'capacity-setup'); controls.setAttribute('aria-label', '测试范围');
     const results = node('section', null, 'capacity-results'); results.setAttribute('aria-label', '测试结果');
-    host.append(controls, results);
+    // 先在离线节点中构建两列。旧实现清空后设置 scrollTop 会触发布局，
+    // 此时结果列还不存在，浏览器按临时变短的页面把用户滚动位置截到顶部。
     controls.append(node('h3', '测试范围'));
     const modes = node('div', null, 'capacity-modes');
     modes.setAttribute('role', 'group'); modes.setAttribute('aria-label', '检测模式');
@@ -199,17 +201,8 @@
     controls.append(modes, actions);
     if (sites.length) {
       controls.append(renderSelection());
-      filterModels();
-      host.querySelector('.capacity-selection').open = Boolean(selectionOpen);
-      const list = host.querySelector('.capacity-picker > .capacity-models');
-      if (list) { list.scrollTop = listScroll; }
-      if (focusedModel) {
-        [...host.querySelectorAll('.capacity-model')].find(el => el.textContent === focusedModel)?.querySelector('input')?.focus({ preventScroll: true });
-      }
-      if (searchFocused) {
-        const search = host.querySelector('.capacity-search input'); search.focus({ preventScroll: true });
-        search.setSelectionRange(searchPosition, searchPosition);
-      }
+      filterModels(controls);
+      controls.querySelector('.capacity-selection').open = Boolean(selectionOpen);
     }
     const concurrencyLabel = node('label', '并发数', 'capacity-concurrency');
     const concurrencyInput = node('input'); concurrencyInput.type = 'number';
@@ -320,7 +313,10 @@
         fill.style.width = Math.min(100, Math.max(0, metrics.end_to_end_tokens_per_second / maxSpeed * 100)) + '%';
         track.append(fill); throughput.append(track);
       } else { throughput.append(node('span', '—', 'capacity-unknown')); }
-      const latency = node('span', metrics.ttft_seconds != null ? metrics.ttft_seconds.toFixed(2) + 's' : '—', 'capacity-latency');
+      // 在途时即可显示实测首字；旧版完整消息事件不能作为首字时间补入。
+      const firstText = metrics.ttft_seconds ?? (row.status === 'running' && row.output_observation?.kind === 'text_delta'
+        ? row.output_observation.elapsed_seconds : null);
+      const latency = node('span', firstText != null ? firstText.toFixed(2) + 's' : '—', 'capacity-latency');
       latency.setAttribute('aria-label', '首字延迟');
       const status = node('span', null, 'capacity-row-state');
       const badge = node('span', resultLabel, 'capacity-badge'); badge.dataset.status = row.capacity_detected ? 'capacity' : row.status;
@@ -332,7 +328,10 @@
       const chevron = window.BenchUI?.icon('chevron-down');
       head.append(identity, throughput, latency, status); if (chevron) { head.append(chevron); }
       item.append(head);
-      if (row.status === 'running' && row.output_observation) { item.append(node('p', '已收到完整消息，等待请求结束')); }
+      if (row.status === 'running' && row.output_observation) {
+        item.append(node('p', row.output_observation.kind === 'text_delta'
+          ? '已收到正文，继续输出中' : '已收到完整消息，等待请求结束'));
+      }
       for (const event of row.events || []) {
         item.append(node('p', '+' + event.elapsed_seconds + 's · ' + event.category));
       }
@@ -356,7 +355,7 @@
       if (performanceRun && row.status === 'success') {
         item.append(node('p', '端到端吞吐 = 上游输出 token ÷ 响应完成耗时；包含等待和思考，输出用量可能包含推理 token。', 'capacity-note'));
         if (row.transport === 'codex-cli' || (!row.transport && metrics.ttft_seconds == null)) {
-          item.append(node('p', '首 token 延迟、纯生成速度：当前 CLI 未提供逐 token 时序。', 'capacity-note'));
+          item.append(node('p', '本次记录未提供逐 token 时序，无法补算首字延迟；在本站登录 ChatGPT 后重新测速可采集。', 'capacity-note'));
         } else {
           item.append(node('p', '首字延迟取第一个非空正文增量；不将推理内容计入首字。', 'capacity-note'));
         }
@@ -365,6 +364,20 @@
         }
       }
       results.append(item);
+    }
+    host.replaceChildren(controls, results);
+    // scrollTop 和 focus 都可能强制计算布局；只允许在结果及展开状态完整后调用。
+    // preventScroll 保留用户正在查看的位置，不能把焦点恢复变成自动跳转。
+    if (sites.length) {
+      const list = host.querySelector('.capacity-picker > .capacity-models');
+      if (list) { list.scrollTop = listScroll; }
+      if (focusedModel) {
+        [...host.querySelectorAll('.capacity-model')].find(el => el.textContent === focusedModel)?.querySelector('input')?.focus({ preventScroll: true });
+      }
+      if (searchFocused) {
+        const search = host.querySelector('.capacity-search input'); search.focus({ preventScroll: true });
+        search.setSelectionRange(searchPosition, searchPosition);
+      }
     }
   }
 

@@ -9,6 +9,7 @@ import time
 import uuid
 
 import codex_channel
+import codex_stream
 import config
 import llm
 import official_channels
@@ -329,7 +330,7 @@ class Probe:
             """记录首个输出事件的时间，正文和后续增量不进入检测结果。
 
             Args:
-                event: 官方渠道提供的完整消息时间元数据，不是首 token 时间。
+                event: 官方渠道提供的输出时间；只有 text_delta 证明首字已经到达。
             """
             with self.lock:
                 row["output_observation"] = event
@@ -339,8 +340,9 @@ class Probe:
             connection = self.connections[row["site"]]
             channel = official_channels.adapter(connection["base_url"])
             if channel is codex_channel:
-                response = channel.complete(row["model"], options["prompt"], options["timeout"], self.stop,
-                                            on_diagnostic=observe, on_output=observe_output)
+                complete = codex_stream.complete if mode == "performance" else channel.complete
+                response = complete(row["model"], options["prompt"], options["timeout"], self.stop,
+                                    on_diagnostic=observe, on_output=observe_output)
             else:
                 # 复用评测的渠道适配与可终止请求进程。固定提示词，禁用应用层兼容重试，
                 # 避免测速混入多次请求；配置和密钥仅从服务端已保存站点中读取。
@@ -353,7 +355,7 @@ class Probe:
                 row["status"] = "success" if response.get("completed") and not response.get("error") else "failed"
                 row["capacity_detected"] |= response.get("transport_diagnostics", {}).get("capacity_detected", False)
                 row["metrics"] = performance_metrics(response, time.monotonic() - started, mode)
-                row["transport"] = "codex-cli" if channel is codex_channel else "kimi-acp" if channel else "api-stream"
+                row["transport"] = response.get("transport", "codex-cli") if channel is codex_channel else "kimi-acp" if channel else "api-stream"
                 if row["status"] == "failed":
                     row["reason"] = "响应未完整结束或正文无效，未计算速度"
                 if response.get("response_model"):

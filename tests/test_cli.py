@@ -1,6 +1,7 @@
 """覆盖 CLI 的多类任务路由、复核等待和失败退出码，不调用真实模型。"""
 import contextlib
 import io
+import json
 import unittest
 from unittest.mock import patch
 
@@ -80,6 +81,65 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cli.select_targets(args, FakeClient([]))
         self.assertEqual(cli.result_path("iq", "../config?x=1"), "/api/iq/run/..%2Fconfig%3Fx%3D1")
+
+    def test_performance_text_formats_ttft_without_inventing_missing_values(self):
+        """文本显示两位小数和单位；缺失、非法和完整消息时间均不能变成首字。"""
+        values = [34.809556375, None, 0, -1, True, float("nan"), float("inf")]
+        for value in values:
+            with self.subTest(value=value):
+                out = io.StringIO()
+                row = {"site": "official", "model": "gpt-test", "status": "success",
+                       "metrics": {"ttft_seconds": value, "end_to_end_tokens_per_second": None}}
+                with contextlib.redirect_stdout(out):
+                    cli.emit({"rows": [row]})
+                expected = "34.81s" if value == 34.809556375 else "0.00s" if type(value) is int and value == 0 else "-"
+                self.assertIn("首字延迟 (TTFT)", out.getvalue())
+                self.assertIn(f"\t-\t{expected}\t", out.getvalue())
+                self.assertNotIn("None", out.getvalue())
+        legacy = {"status": "running", "output_observation": {"kind": "message_completed", "elapsed_seconds": 41}}
+        self.assertIsNone(cli._first_text_seconds(legacy))
+        legacy.update(status="failed", output_observation={"kind": "text_delta", "elapsed_seconds": 1})
+        self.assertIsNone(cli._first_text_seconds(legacy))
+
+    def test_streaming_ttft_is_reported_once_and_json_remains_parseable(self):
+        """归档未更新时补读实时首字；重复轮询不刷屏，stdout 仍是完整 JSON。"""
+        run_id = "a" * 32
+        archived = {"id": run_id, "status": "running", "rows": [
+            {"site": "official", "model": "gpt-test", "status": "running"}]}
+        live = {**archived, "rows": [{**archived["rows"][0],
+                 "output_observation": {"kind": "text_delta", "elapsed_seconds": 1.234567}}]}
+        final = {"id": run_id, "status": "completed", "rows": [
+            {"site": "official", "model": "gpt-test", "status": "success",
+             "metrics": {"ttft_seconds": 1.234567, "end_to_end_tokens_per_second": 42}}]}
+        client = FakeClient([archived, live, archived, live, final])
+        args = cli.parser().parse_args(["results", "performance", run_id, "--watch", "--json"])
+        out, err = io.StringIO(), io.StringIO()
+        with patch("cli_commands.time.sleep"), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.execute(args, client), 0)
+        self.assertEqual(err.getvalue().count("首字延迟 (TTFT): 1.23s"), 1)
+        self.assertEqual(json.loads(out.getvalue()), final)
+        self.assertEqual(sum(path == "/api/probe" for path, _ in client.calls), 2)
+
+    def test_live_snapshot_cannot_switch_the_requested_batch(self):
+        """两次查询之间切换了当前批次时，仍返回原批次，不误用新任务的首字。"""
+        selected = {"id": "old", "status": "running", "rows": []}
+        other = {"id": "new", "status": "running", "rows": []}
+        completed = {**selected, "status": "completed"}
+        client = FakeClient([selected, other, completed])
+        self.assertEqual(cli.read_result(client, "performance", "old"), completed)
+        self.assertEqual(client.calls[-1], ("/api/probe/history/old", None))
+
+    def test_same_model_at_different_sites_gets_separate_first_text_progress(self):
+        """跨站点同名模型分别显示首字；未知和旧版消息事件保持未知。"""
+        data = {"status": "completed", "rows": [
+            {"site": site, "model": "same", "status": "success", "metrics": {"ttft_seconds": seconds}}
+            for site, seconds in (("a", 1), ("b", 2), ("legacy", None))]}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cli.wait_result(FakeClient([data]), "performance", "run")
+        self.assertIn("a / same  首字延迟 (TTFT): 1.00s", err.getvalue())
+        self.assertIn("b / same  首字延迟 (TTFT): 2.00s", err.getvalue())
+        self.assertEqual(err.getvalue().count("首字延迟"), 2)
 
 
 if __name__ == "__main__":

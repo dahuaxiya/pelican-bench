@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import json
+import math
 import os
 import sys
 import time
@@ -87,8 +88,47 @@ def discover():
     return None
 
 
+def _metric(value, suffix=""):
+    """将实测数字格式化为两位小数，未知或非法指标不能显示成零。
+
+    Args:
+        value: 原始指标，只有有限且非负的数字有效；布尔值不算数字。
+        suffix: 文本输出的固定单位，不修改 JSON 中的数值。
+    Returns:
+        带单位的数字；未知值返回 -。
+    """
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        return "-"
+    return f"{value:.2f}{suffix}"
+
+
+def _first_text_seconds(row):
+    """优先读取最终首字指标，在途请求只接受真实正文增量的计时。
+
+    Args:
+        row: 网页与 CLI 共用的单模型快照，不修改原数据。
+    Returns:
+        原始精度的秒数；完整消息事件、旧记录或失败后的部分输出返回 None。
+    """
+    value = (row.get("metrics") or {}).get("ttft_seconds")
+    if _metric(value) != "-":
+        return value
+    observation = row.get("output_observation") or {}
+    # 旧 exec 渠道的 message_completed 只证明整条回答到达，不能拿来补造首字。
+    if row.get("status") == "running" and observation.get("kind") == "text_delta":
+        value = observation.get("elapsed_seconds")
+        if _metric(value) != "-":
+            return value
+    return None
+
+
 def emit(value, as_json=False):
-    """JSON 输出保持可解析；文本输出把模型指标按行展示，不省略错误信息。"""
+    """输出结果；文本统一指标格式，JSON 保留原始精度和未知值。
+
+    Args:
+        value: 来自本机服务的结果快照。
+        as_json: 为 True 时只输出 JSON，不加入表头或进度文字。
+    """
     if as_json or not isinstance(value, dict):
         print(json.dumps(value, ensure_ascii=False, indent=2))
         return
@@ -97,11 +137,11 @@ def emit(value, as_json=False):
         if key in value:
             print(f"{key}: {value[key]}")
     if "rows" in value:
-        print("站点 / 模型\t状态\t端到端 token/s\t首字秒数\t容量信号")
+        print("站点 / 模型\t状态\t端到端 token/s\t首字延迟 (TTFT)\t容量信号")
         for row in value["rows"]:
             metrics = row.get("metrics") or {}
             print(f'{row.get("site", "")} / {row.get("model", "")}\t{row.get("status", "")}\t'
-                  f'{metrics.get("end_to_end_tokens_per_second", "-")}\t{metrics.get("ttft_seconds", "-")}\t'
+                  f'{_metric(metrics.get("end_to_end_tokens_per_second"))}\t{_metric(_first_text_seconds(row), "s")}\t'
                   f'{"有" if row.get("capacity_detected") else "未发现"}')
             if row.get("reason"):
                 print("  " + row["reason"])
@@ -238,6 +278,26 @@ def result_path(kind, run_id, full=False):
     return prefix + urllib.parse.quote(run_id, safe="") + ("?full=1" if full else "")
 
 
+def read_result(client, kind, run_id, full=False):
+    """读取指定批次；性能任务在途时补读实时快照，以获取尚未归档的首字事件。
+
+    Args:
+        client: 已核对实例身份的本机 API 客户端。
+        kind: 已通过参数校验的测评类型。
+        run_id: 用户选择的批次 ID，绝不能换成另一个当前批次。
+        full: 是否包含题目与回答，只对支持它的测评生效。
+    Returns:
+        指定批次的实时或历史数据；不同批次的实时数据不会覆盖所选历史。
+    """
+    data = client.request(result_path(kind, run_id, full))
+    if kind in ("performance", "capacity") and pending(kind, data):
+        current = client.request("/api/probe")
+        # 历史只在状态落盘时更新；首字先出现在内存快照中。两次 GET 之间可能
+        # 已开始新批次，此时必须回读原批次，不能把新批次的时间关联到旧模型。
+        data = current if current.get("id") == run_id else client.request(result_path(kind, run_id, full))
+    return data
+
+
 def pending(kind, data):
     """IQ 的回答完成不代表最终分可用；仍要等同一批次的自动复核结束。"""
     if kind == "svg":
@@ -267,11 +327,22 @@ def result_exit(kind, data):
 
 
 def wait_result(client, kind, run_id, timeout=0, full=False):
-    """进度写 stderr，stdout 留给最终结果；中断或等待超时都保留服务中的原任务。"""
+    """等待同一批次并报告首字事件；进度写 stderr，stdout 留给最终结果。
+
+    Args:
+        client: 已核对身份的本机 API 客户端。
+        kind: 测评类型，决定最终完成及自动复核的判定规则。
+        run_id: 等待的固定批次 ID。
+        timeout: CLI 等待上限秒数，0 为不限；到期不取消后台任务。
+        full: 是否请求完整题目与回答。
+    Returns:
+        最后快照和退出码；用户中断时保留后台任务并传播 KeyboardInterrupt。
+    """
     started, last, missing_review = time.monotonic(), None, None
+    first_text_reported = set()
     try:
         while True:
-            data = client.request(result_path(kind, run_id, full))
+            data = read_result(client, kind, run_id, full)
             review = data.get("auto_review") or {}
             rows = data.get("rows", [])
             done = data.get("done", sum(r.get("status") not in ("queued", "running") for r in rows))
@@ -285,6 +356,15 @@ def wait_result(client, kind, run_id, timeout=0, full=False):
             if text != last:
                 print(text, file=sys.stderr, flush=True)
                 last = text
+            if kind in ("performance", "capacity"):
+                for row in rows:
+                    key = (row.get("site", ""), row.get("model", ""))
+                    first_text = _first_text_seconds(row)
+                    # 每个站点模型只报一次，不随轮询刷屏；JSON 标准输出始终不混入进度。
+                    if first_text is not None and key not in first_text_reported:
+                        print(f'  {key[0]} / {key[1]}  首字延迟 (TTFT): {_metric(first_text, "s")}',
+                              file=sys.stderr, flush=True)
+                        first_text_reported.add(key)
             if not pending(kind, data):
                 return data, result_exit(kind, data)
             if kind == "iq" and data.get("status") == "completed" and not review:
@@ -301,7 +381,14 @@ def wait_result(client, kind, run_id, timeout=0, full=False):
 
 
 def execute(args, client):
-    """通过已有 API 配置站点、提交和查询任务；退出码明确区分提交成功与完整测评。"""
+    """通过已有 API 配置站点、提交和查询任务，不另起模型调用。
+
+    Args:
+        args: parser 已校验的命令参数；敏感值只从环境或 stdin 读取。
+        client: 经本机运行记录校验的 API 客户端。
+    Returns:
+        命令退出码，区分提交成功、完整测评和运行失败。
+    """
     command = args.command
     if command == "sites":
         if args.action == "list":
@@ -333,7 +420,7 @@ def execute(args, client):
             return code
         history = {"performance": "/api/probe/history", "capacity": "/api/probe/history", "iq": "/api/iq/runs",
                    "engineering": "/api/swe/runs", "svg": "/api/runs"}
-        data = client.request(result_path(args.kind, args.run_id, args.full) if args.run_id else history[args.kind])
+        data = read_result(client, args.kind, args.run_id, args.full) if args.run_id else client.request(history[args.kind])
     elif command == "cancel":
         endpoint = "/api/probe/cancel" if args.kind in ("performance", "capacity") else f'/api/{"swe" if args.kind == "engineering" else "iq"}/cancel'
         data = client.request(endpoint, {"run_id": args.run_id})

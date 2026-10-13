@@ -1,6 +1,6 @@
 {
   "name": "pelican-bench",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Benchmark model endpoints from your own computer with a local web UI.",
   "license": "MIT",
   "engines": { "node": ">=20" },
@@ -13,7 +13,7 @@
   "files": [
     "bin/pelican.py", "bin/pelican-bench.mjs", "scripts/check-package.mjs", "local_launcher.py", "cli_commands.py", "runtime_paths.py",
     "app.py", "config.py", "bench.py", "llm.py", "svg_sanitize.py", "report.py",
-    "codex_auth.py", "codex_channel.py", "kimi_channel.py", "kimi-bench-agent.md", "official_channels.py",
+    "codex_auth.py", "codex_channel.py", "codex_stream.py", "kimi_channel.py", "kimi-bench-agent.md", "official_channels.py",
     "codex_probe.py", "performance_archive.py", "iq.py", "iq_tasks.py", "iq_review.py",
     "iq_scoring.py", "iq_benchmarks.py", "iq_setup.py", "swe.py", "swe_worker.py",
     "swe_setup.py", "swe-requirements.lock",

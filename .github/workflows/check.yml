@@ -17,3 +17,7 @@ jobs:
         with:
           node-version: '22'
       - run: python -B -m unittest discover -s tests -v
+      - name: Check frontend timing and rankings
+        run: |
+          npm install --prefix "$RUNNER_TEMP/pelican-ui-tests" --no-package-lock --ignore-scripts jsdom@26.1.0
+          NODE_PATH="$RUNNER_TEMP/pelican-ui-tests/node_modules" node --test tests/*.cjs

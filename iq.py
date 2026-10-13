@@ -754,12 +754,12 @@ def leaderboard(cohort_id: str | None = None, benchmark: str | None = None,
 
     @param cohort_id 题库和评分版本哈希；未指定时选择最近产生有效成绩的版本
     @param benchmark 可选基准过滤；正式榜不混入该基准试跑，foundation 保留旧题集
-    @param scoring reviewed 默认仅发布复核完成的最终分；official 和 normalized 保留原始审计口径
+    @param scoring reviewed 默认发布最终分；comparison 同批展示复核前后，旧审计口径保持兼容
     @return 版本选项和有效成绩；运行参数随成绩返回，不作为拆榜条件
     """
     if benchmark not in (None, "bbeh-mini", "arc-agi-2", "foundation"):
         raise ValueError("未知的基准")
-    if scoring not in ("official", "normalized", "reviewed"):
+    if scoring not in ("official", "normalized", "reviewed", "comparison"):
         raise ValueError("未知的评分方式")
     cohorts = {}
     for run in history(limit=None):
@@ -768,12 +768,17 @@ def leaderboard(cohort_id: str | None = None, benchmark: str | None = None,
         if benchmark and run["suite"].get("benchmark", "foundation") != benchmark:
             continue
         for summary in run["summary"]:
+            if scoring == "comparison":
+                # 两列必须来自同一份回答，不能拼接两次测试的各自最好或最新分数。
+                summary = {**summary, "before_review": {
+                    k: copy.deepcopy(summary.get(k)) for k in ("rank_score", "correct", "categories")
+                }, "after_review": copy.deepcopy(summary["final"])}
             if scoring == "normalized":
                 summary = {**summary, **summary["normalized"]}
             elif scoring == "reviewed":
                 summary = {**summary, **summary["final"]}
-            # 只检验当前模型，不等待整个批次。无成绩和待复核的记录留在历史里，
-            # 不能占据榜单行、创建空版本，或覆盖先前有效成绩；零分仍然有效。
+            # 只检验当前模型，不等待整个批次。缺测不能入榜，零分仍然有效。
+            # 对比模式允许原始成绩入榜，待复核的最终分保持为空。
             score = summary.get("rank_score")
             if not summary["complete"] or type(score) not in (int, float) or not math.isfinite(score):
                 continue
@@ -794,7 +799,7 @@ def leaderboard(cohort_id: str | None = None, benchmark: str | None = None,
             identity = {"suite": edition, "scoring": {"mode": scoring}}
             if scoring == "normalized":
                 identity["scoring"]["version"] = run["normalization_version"]
-            elif scoring == "reviewed":
+            elif scoring in ("reviewed", "comparison"):
                 identity["scoring"].update(version=run["review_version"], normalization=run["normalization_version"])
             key = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False,
                                             allow_nan=False).encode()).hexdigest()
@@ -807,8 +812,15 @@ def leaderboard(cohort_id: str | None = None, benchmark: str | None = None,
             existing = group["entries"].get(pair)
             # 文件遍历顺序和批次启动顺序都不代表模型完成顺序；重启后也按同一顺序选择。
             latest = (completed_at, run["started_at"], run["run_id"])
-            if existing is not None and latest <= (existing["completed_at"], existing["started_at"], existing["run_id"]):
-                continue
+            if existing is not None:
+                previous = (existing["completed_at"], existing["started_at"], existing["run_id"])
+                if scoring == "comparison":
+                    # 已复核成绩继续有效，新的待复核记录不能让正式名次消失。
+                    # 尚无最终成绩时允许展示最新原始分，但复核后仍无分数和名次。
+                    latest = (bool(summary["after_review"].get("ready")), *latest)
+                    previous = (bool(existing["after_review"].get("ready")), *previous)
+                if latest <= previous:
+                    continue
             group["entries"][pair] = {**copy.deepcopy(summary),
                                       "run_id": run["run_id"], "started_at": run["started_at"],
                                       "finished_at": run["finished_at"], "status": run["status"],

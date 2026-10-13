@@ -271,6 +271,11 @@ progress::-webkit-progress-value { background: var(--page-blue); }
   #iq-rank-table td.iq-unranked { font-size: 10px; }
   #iq-rank-table :is(th, td):last-child, #swe-board :is(th, td):last-child { width: 42px; }
   #iq-rank-table .record-action, #swe-board .record-action { padding: 0; width: 32px; min-height: 36px; }
+  /* 双列成绩在手机也必须可比较，覆盖旧榜单隐藏第五列的规则。 */
+  #iq-rank-table .iq-comparison-table :is(th, td):nth-child(4),
+  #iq-rank-table .iq-comparison-table :is(th, td):nth-child(5) { display: table-cell; width: 72px; }
+  #iq-rank-table .iq-comparison-table .iq-comparison-score > strong { font-size: 14px; }
+  #iq-rank-table .iq-comparison-table .iq-comparison-score > .iq-score-pending { font-size: 11px; }
   .record-action:has(svg) span { display: none; }
   .iq-pagination { gap: 10px; }
   .iq-page-controls { gap: 6px; }

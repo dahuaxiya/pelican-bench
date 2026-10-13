@@ -30,7 +30,7 @@ pelican-bench --data-dir ./my-bench-data
 也保留 npm 安装入口，需要 Node.js 20+ 和 Python 3.10+。npm 注册表尚未发布，请使用 GitHub Release 提供的安装包：
 
 ```sh
-npm install -g ./pelican-bench-0.3.0.tgz
+npm install -g ./pelican-bench-0.4.0.tgz
 pelican-bench
 ```
 
@@ -93,6 +93,10 @@ pelican-bench test engineering --site my-api --model gpt-6.1-sol --suite smoke
 测试从当前电脑发出，可能使用模型额度。--site 和 --model 都可重复，组合测试；--target 指定精确组合，不能与它们混用。测速、容量和 IQ 并发可设为 1 到 200；默认沿用网页配置规则。
 
 默认等待测试结束，IQ 还会等待原批次自动重试和自动复核。复核模型在网页设置；不可用或复核失败时显示未完成状态，不把临时分当最终分。--no-wait 提交后立即返回批次 ID；Ctrl+C 或 --wait-timeout 只停止 CLI 等待，不取消后台任务。
+
+性能测速收到首个正文片段后，终端会立即显示该站点模型的首字延迟（TTFT），最终结果也保留这一列。在本站登录的 ChatGPT 账号通过 Codex app-server 采集；旧记录和没有正文增量的渠道显示 -，不拿整条回答耗时替代首字。JSON 的最终指标字段是 rows[].metrics.ttft_seconds，单位为秒，保留原始精度；缺失时为 null。
+
+IQ 榜单同时展示同一次测评的复核前、复核后成绩与名次，可按任一成绩或平均耗时排序。每个站点模型保留最新有效成绩；新记录尚未复核完成时，继续展示已有最终成绩。
 
 ~~~sh
 pelican-bench results performance                 # 历史批次列表（包含容量检测）

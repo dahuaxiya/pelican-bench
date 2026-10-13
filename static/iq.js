@@ -59,7 +59,7 @@
 
   /**
    * 按固定百分制创建成绩条；它表示正确率，不表示任务进度，也不以页内最高分归一化。
-   * @param {number} value 已通过有效性检查的最终分或明确选择的留档分
+   * @param {number} value 已通过有效性检查的复核前或复核后成绩
    * @param {string} label 无障碍名称，包含模型与评分口径
    * @return {HTMLElement} 有数值语义的横向条；真实零分保持零长度
    */
@@ -79,28 +79,78 @@
   }
 
   /**
-   * 绘制当前页的横向成绩条，沿用全榜计算的名次和筛选条件。
-   * @param {Array<Object>} entries 本页有效成绩，含 rank 和原榜单 row
-   * @param {boolean} official 是否为官方题集正确率；自编题注明加权分
-   * @return {HTMLElement} 可通过每行记录入口继续查看原回答的图表
+   * 读取完整成绩的排序值；待复核、缺失耗时和非法数值不伪装成零分。
+   * @param {Object} row 同一次测评的两种成绩
+   * @param {string} basis before、after 或 mean_seconds
+   * @return {number|null} 有效分数或耗时
    */
-  function rankBars(entries, official) {
+  function rankValue(row, basis) {
+    const result = basis === 'before' ? row.before_review : row.after_review;
+    if (basis === 'after' && !result?.ready) { return null; }
+    const value = basis === 'mean_seconds' ? row.mean_seconds : result?.rank_score;
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 &&
+      (basis === 'mean_seconds' || value <= 100) ? value : null;
+  }
+
+  /**
+   * 在整个筛选范围内计算并列名次；空值置后且不赋名次，分页不改变排名。
+   * @param {Array<Object>} rows 当前筛选范围内的所有成绩
+   * @param {string} basis 排名依据
+   * @return {Map<Object,number>} 每行对应的名次，重复分数共享名次
+   */
+  function rankPositions(rows, basis) {
+    const sorted = rows.filter(row => rankValue(row, basis) !== null).slice().sort((a, b) =>
+      (rankValue(a, basis) - rankValue(b, basis)) * (basis === 'mean_seconds' ? 1 : -1));
+    const positions = new Map(); let previous = null; let rank = 0;
+    sorted.forEach((row, index) => {
+      const value = rankValue(row, basis);
+      if (value !== previous) { rank = index + 1; }
+      previous = value; positions.set(row, rank);
+    });
+    return positions;
+  }
+
+  /**
+   * 创建一列成绩和名次；颜色只作辅助，标题始终标明复核前后。
+   * @param {Object} row 原榜单行
+   * @param {string} basis before 或 after
+   * @param {number|undefined} rank 当前范围内的名次，待复核时不存在
+   * @param {boolean} bars 是否同时绘制百分制横条
+   * @return {HTMLElement} 不含可执行模型文本的成绩单元
+   */
+  function comparisonScore(row, basis, rank, bars) {
+    const score = rankValue(row, basis);
+    const label = basis === 'before' ? '复核前' : '复核后';
+    const cell = element('div', undefined, 'iq-comparison-score iq-score-' + basis);
+    const heading = element('div', undefined, 'iq-comparison-caption');
+    heading.append(element('span', label), element('small', rank == null ? '未排名' : '#' + rank));
+    cell.append(heading, element('strong', score === null ?
+      (basis === 'after' ? '待复核' : '—') : number(score, 2) + '%', score === null ? 'iq-score-pending' : ''));
+    if (bars && score !== null) { cell.append(accuracyBar(score, row.site + ' / ' + row.model + ' ' + label)); }
+    return cell;
+  }
+
+  /**
+   * 两列同时展示同一记录的复核前后成绩，名次已在分页之前计算。
+   * @param {Array<Object>} entries 本页行与所选依据的名次
+   * @param {Object} positions before 和 after 的全范围名次
+   * @return {HTMLElement} 可追溯来源的双列横条图
+   */
+  function rankBars(entries, positions) {
     const chart = element('div', undefined, 'iq-bar-chart');
     chart.setAttribute('role', 'list'); chart.setAttribute('aria-label', '正确率横向排行榜');
     const axis = element('div', undefined, 'iq-bar-axis'); axis.setAttribute('aria-hidden', 'true');
-    const scale = element('div', undefined, 'iq-bar-scale');
-    ['0%', '50%', '100%'].forEach(text => scale.append(element('span', text)));
-    axis.append(element('span', '排名'), element('span', '站点 / 模型'), scale,
-      element('span', official ? '正确率' : '加权分'));
+    axis.append(element('span', '排名'), element('span', '站点 / 模型'),
+      element('span', '复核前'), element('span', '复核后'));
     chart.append(axis);
     entries.forEach(({ row, rank }) => {
-      const score = scoreOf(row);
       const item = element('div', undefined, 'iq-bar-item'); item.setAttribute('role', 'listitem');
       const identity = element('div', undefined, 'iq-bar-identity');
-      identity.append(element('strong', row.model), element('small', row.site));
-      item.append(element('span', String(rank), 'iq-bar-rank'), identity,
-        accuracyBar(score, row.site + ' / ' + row.model + (official ? ' 正确率' : ' 加权分')),
-        element('strong', number(score, 2) + '%', 'iq-bar-value'));
+      identity.append(element('strong', row.model), element('small', row.site),
+        element('small', '平均耗时 ' + (rankValue(row, 'mean_seconds') === null ? '—' : number(row.mean_seconds) + 's')));
+      item.append(element('span', rank == null ? '—' : String(rank), 'iq-bar-rank'), identity,
+        comparisonScore(row, 'before', positions.before.get(row), true),
+        comparisonScore(row, 'after', positions.after.get(row), true));
       const link = element('button', undefined, 'record-action'); link.type = 'button';
       link.title = '查看记录'; link.setAttribute('aria-label', '查看 ' + row.site + ' / ' + row.model + ' 的记录');
       const icon = window.BenchUI?.icon('arrow-right');
@@ -159,41 +209,13 @@
     select.disabled = !options.length;
   }
 
-  /**
-   * 展示单项成绩的实际参数；长期榜允许预算不同，但不把这些成绩伪装成统一预算。
-   * @param {Object} row 后端已选出的最新有效成绩
-   * @return {HTMLTableCellElement} 可展开的参数单元格；旧记录缺参数时显示占位符
-   */
-  function rankConditions(row) {
-    const cell = element('td');
-    const c = row.conditions;
-    if (!c) { cell.textContent = '—'; return cell; }
-    const o = c.options;
-    const details = element('details');
-    details.append(element('summary', '每题 ' + o.repeats + ' 次'));
-    const modes = { default: '默认', enabled: '开启', disabled: '关闭', 'codex-medium': 'Codex medium', 'kimi-default': 'Kimi 默认' };
-    const lines = c.execution ? [(c.execution.transport === 'kimi-acp' ? 'Kimi 登录态 · ' : 'Codex 登录态 · ') + c.execution.cli_version, '推理 ' + c.execution.reasoning_effort,
-      '输出预算：CLI 默认', '单题总时限 ' + o.timeout_seconds + 's'] :
-      ['输出上限 ' + o.max_tokens + ' tokens', '推理：' + (modes[c.thinking_mode] || c.thinking_mode),
-        'temperature ' + o.temperature, '请求总时限 ' + o.timeout_seconds + 's'];
-    lines.push('并发 ' + o.concurrency);
-    if (c.retry) {
-      lines.push('含接口失败项重试 · 原记录 ' + c.retry.source_run_id.slice(0, 12));
-      const execution = c.retry.executions?.find(e => e.site === row.site && e.model === row.model)?.execution;
-      if (execution) { lines.push('重试适配器 ' + execution.policy + ' · ' + execution.cli_version); }
-    }
-    lines.forEach(text => details.append(element('div', text)));
-    cell.append(details); return cell;
-  }
-
-  /** 先在整个筛选范围排序和计算并列名次，再分页；换页不会重新从第一名开始。 */
+  /** 同时计算复核前后名次，按用户选择重排；分页和视图切换不改变成绩来源。 */
   function renderRanking() {
     if (!state.rankData) { return; }
     const data = state.rankData;
     const mode = state.rankMode;
     // 防御升级前的旧后端：无效记录只留在运行历史，不占筛选选项或分页名额。
-    const validEntries = data.entries.filter(row => typeof scoreOf(row) === 'number' && Number.isFinite(scoreOf(row)) &&
-      scoreOf(row) >= 0 && scoreOf(row) <= 100 && row.complete !== false);
+    const validEntries = data.entries.filter(row => rankValue(row, 'before') !== null && row.complete !== false);
     node('iq-rank-scope-wrap').hidden = mode === 'all';
     if (mode !== 'all') {
       const caption = mode === 'site' ? '站点' : '模型';
@@ -204,19 +226,25 @@
       state.rankScope[mode] = node('iq-rank-scope').value;
     }
     const rows = validEntries.filter(row => mode === 'all' || row[mode] === state.rankScope[mode]);
-    // 仅在选定题库和评分版本中排序，运行预算不再拆榜。
-    rows.sort((a, b) => (scoreOf(a) == null) - (scoreOf(b) == null) || (scoreOf(b) || 0) - (scoreOf(a) || 0) ||
+    const basis = node('iq-rank-sort').value;
+    const positions = { before: rankPositions(rows, 'before'), after: rankPositions(rows, 'after') };
+    const selectedPositions = positions[basis] || rankPositions(rows, basis);
+    // 排序只改变展示顺序，不触发重新选取历史记录；待复核的最终分始终排在末尾。
+    rows.sort((a, b) => (rankValue(a, basis) === null) - (rankValue(b, basis) === null) ||
+      ((rankValue(a, basis) ?? 0) - (rankValue(b, basis) ?? 0)) * (basis === 'mean_seconds' ? 1 : -1) ||
       a.site.localeCompare(b.site) || a.model.localeCompare(b.model));
-    const ranked = rows.filter(row => scoreOf(row) != null).length;
-    node('iq-metric-count').textContent = ranked;
-    node('iq-metric-score').textContent = ranked ? number(scoreOf(rows.find(row => scoreOf(row) != null)), 2) + '%' : '—';
+    const ranked = positions.after.size;
+    node('iq-metric-count').textContent = rows.length;
+    const scoreBasis = basis === 'before' ? 'before' : 'after';
+    const scores = rows.map(row => rankValue(row, scoreBasis)).filter(score => score !== null);
+    node('iq-metric-score').textContent = scores.length ? number(Math.max(...scores), 2) + '%' : '—';
     const group = data.cohorts.find(item => item.id === data.cohort_id);
     const suite = group?.suite || state.suites.find(s => s.benchmark === node('iq-rank-benchmark').value && s.formal);
     const official = Boolean(suite?.benchmark);
-    node('iq-metric-label').textContent = official ? '最高正确率' : '最高基础题加权分';
+    node('iq-metric-label').textContent = (scoreBasis === 'before' ? '复核前' : '复核后') + (official ? '最高正确率' : '最高加权分');
     node('iq-metric-suite').textContent = group ? group.suite.count + ' 题' : '—';
-    node('iq-rank-status').textContent = rows.length ? ranked +
-      ' 个组合 · 跨历史测试取最新有效成绩 · 同分并列' : '该基准暂无完整有效成绩';
+    node('iq-rank-status').textContent = rows.length ? rows.length + ' 个组合 · ' + ranked + ' 个已复核' +
+      (rows.length > ranked ? ' · ' + (rows.length - ranked) + ' 个待复核' : '') + ' · 同分并列' : '该基准暂无完整有效成绩';
     const box = node('iq-rank-table');
     node('iq-view-bars').setAttribute('aria-pressed', String(state.rankView === 'bars'));
     node('iq-view-table').setAttribute('aria-pressed', String(state.rankView === 'table'));
@@ -237,40 +265,34 @@
       return;
     }
     if (state.rankView === 'bars') {
-      let previous = null; let rank = 0;
-      const entries = rows.map((row, index) => {
-        if (scoreOf(row) !== previous) { rank = index + 1; }
-        previous = scoreOf(row);
-        return { row, rank };
-      });
-      box.replaceChildren(rankBars(entries.slice(offset, end), official));
+      const entries = rows.map(row => ({ row, rank: selectedPositions.get(row) }));
+      box.replaceChildren(rankBars(entries.slice(offset, end), positions));
       return;
     }
-    const table = element('table'); table.setAttribute('aria-label', 'IQ 排行榜成绩');
+    const table = element('table', undefined, 'iq-comparison-table'); table.setAttribute('aria-label', 'IQ 排行榜成绩');
     const head = element('tr');
-    const categories = categoriesOf(suite);
-    ['排名', '站点', '模型', official ? '正确率 / %' : '基础题加权分 /100',
-      ...(categories.length <= 4 ? categories.map(c => c.name) : ['分项成绩']), '有效 / 计划', '评测参数', '均耗时', '成绩时间', '记录'].forEach(title => {
+    ['排名', '站点', '模型', '复核前', '复核后', '平均耗时', '成绩时间', '记录'].forEach(title => {
       const th = element('th', title); th.scope = 'col'; head.append(th);
     });
     const thead = element('thead'); thead.append(head); table.append(thead);
     const body = element('tbody');
-    let previous = null; let rank = 0;
     rows.forEach((row, index) => {
-      const score = scoreOf(row);
-      if (score != null && score !== previous) { rank = index + 1; }
-      previous = score;
+      const rank = selectedPositions.get(row);
       // 页首可能与上一页末尾同分，必须保留此前行计算出的名次。
       if (index < offset || index >= end) { return; }
       const tr = element('tr');
-      tr.append(element('td', score == null ? '—' : String(rank)), element('td', row.site), element('td', row.model),
-        element('td', score == null ? row.unranked_reason : number(score, 2), score == null ? 'iq-unranked' : 'iq-index'));
+      tr.append(element('td', rank == null ? '—' : String(rank)), element('td', row.site), element('td', row.model));
       tr.children[2].dataset.site = row.site;
       tr.children[2].setAttribute('aria-label', row.model + '，站点 ' + row.site);
-      // 缺测时汇总中的分项是交付口径，排行榜不能把它展示成完整能力成绩。
-      appendCategories(tr, row, suite, score != null);
-      tr.append(element('td', (row.valid ?? '—') + ' / ' + (row.expected ?? '—')),
-        rankConditions(row), element('td', number(row.mean_seconds) + 's'));
+      // 手机隐藏独立耗时列，按耗时排序时仍需能在模型旁核对排序数值。
+      if (basis === 'mean_seconds') {
+        tr.children[2].append(element('small', rankValue(row, basis) === null ? '耗时未知' :
+          '平均 ' + number(row.mean_seconds) + 's', 'iq-rank-latency'));
+      }
+      ['before', 'after'].forEach(kind => {
+        const cell = element('td'); cell.append(comparisonScore(row, kind, positions[kind].get(row), false)); tr.append(cell);
+      });
+      tr.append(element('td', rankValue(row, 'mean_seconds') === null ? '—' : number(row.mean_seconds) + 's'));
       tr.append(element('td', new Date((row.completed_at ?? row.started_at) * 1000).toLocaleString()));
       const link = element('button'); link.type = 'button'; link.className = 'record-action';
       link.title = '查看记录'; link.setAttribute('aria-label', '查看 ' + row.site + ' / ' + row.model + ' 的记录');
@@ -294,34 +316,26 @@
     renderRanking();
   }
 
-  /** 读取跨历史长期榜；切换题库或评分版本时，旧响应不得覆盖新选择。 */
+  /** 读取同批对比榜；仅多版本时显示版本选择，过期请求不能覆盖新基准。 */
   async function loadRanking() {
     const ticket = ++state.rankRequest;
     const selected = node('iq-rank-cohort').value;
     node('iq-rank-table').setAttribute('aria-busy', 'true');
     try {
       const data = await request('/api/iq/leaderboard?benchmark=' + encodeURIComponent(node('iq-rank-benchmark').value) +
-        '&scoring=' + encodeURIComponent(node('iq-rank-scoring').value) +
+        '&scoring=comparison' +
         (selected ? '&cohort=' + encodeURIComponent(selected) : ''));
       if (ticket !== state.rankRequest) { return; }
-      // 静态文件可能先于 Python 服务更新；旧后端忽略 scoring 时不能把官方分标成规范化分。
-      node('iq-rank-scoring').querySelector('[value="normalized"]').disabled = !data.normalization_version;
-      if (node('iq-rank-scoring').value === 'normalized' && data.scoring !== 'normalized') {
-        throw new Error('当前服务尚未启用规范化评分，请使用升级后的服务');
-      }
-      if (node('iq-rank-scoring').value === 'reviewed' && (data.scoring !== 'reviewed' || !data.review_version)) {
-        throw new Error('当前服务尚未启用复核后计分，请使用升级后的服务');
-      }
+      // 前端先更新时明确报告版本不匹配，不能将旧单列成绩误标为复核后。
+      if (data.scoring !== 'comparison') { throw new Error('请更新后端后查看复核前后成绩'); }
       if (state.rankData && state.rankData.cohort_id !== data.cohort_id) { state.rankPage = 1; }
       state.rankData = data;
       rankOptions(node('iq-rank-cohort'), data.cohorts.map(group => [group.id,
         (group.suite.name || group.suite.count + ' 题') + ' · ' + group.suite.version.slice(0, 12) +
         ' · ' + group.id.slice(0, 6)]), data.cohort_id, '暂无有效成绩');
+      node('iq-rank-version-wrap').hidden = data.cohorts.length <= 1;
       const group = data.cohorts.find(item => item.id === data.cohort_id);
-      node('iq-rank-condition').textContent = group ? '版本 ' + group.suite.version.slice(0, 12) +
-        (group.scoring?.mode === 'reviewed' ? ' · 复核后最终成绩' :
-          group.scoring?.mode === 'normalized' ? ' · 规范化评分（留档） ' + group.scoring.version : ' · 原始评分（留档）') +
-        ' · 各项成绩的运行预算可能不同' : '暂无完整有效成绩；试跑和失败记录不入榜。';
+      node('iq-rank-condition').textContent = group ? '每个模型取最新有效成绩 · 两列来自同一次评测 · 运行预算可能不同' : '';
       node('iq-rank-error').hidden = true;
       renderRanking();
     } catch (e) {
@@ -1104,9 +1118,7 @@
   node('iq-select-all').addEventListener('click', () => selectModels(node('iq-models'), true));
   node('iq-select-none').addEventListener('click', () => selectModels(node('iq-models'), false));
   node('iq-rank-refresh').addEventListener('click', loadRanking);
-  node('iq-rank-scoring').addEventListener('change', () => {
-    node('iq-rank-cohort').replaceChildren(); state.rankPage = 1; loadRanking();
-  });
+  node('iq-rank-sort').addEventListener('change', () => { state.rankPage = 1; renderRanking(); });
   node('iq-judge-site').addEventListener('change', judgeChanged);
   node('iq-judge-model').addEventListener('change', judgeChanged);
   node('iq-judge-save').addEventListener('click', saveJudgeSettings);

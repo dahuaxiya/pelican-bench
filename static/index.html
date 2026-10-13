@@ -111,9 +111,9 @@
       </fieldset>
       <div class="iq-rank-filters">
         <label>基准<select id="iq-rank-benchmark" aria-label="排行榜基准"><option value="bbeh-mini">BBEH Mini</option><option value="arc-agi-2">ARC-AGI-2 · 公开集文本模式</option><option value="foundation">自编基础题</option></select></label>
-        <label>评分<select id="iq-rank-scoring" aria-label="排行榜评分方式"><option value="reviewed">最终成绩（复核后）</option><option value="official">原始评分（留档）</option><option value="normalized">规范化评分（留档）</option></select></label>
+        <label>排序依据<select id="iq-rank-sort" aria-label="排行榜排序依据"><option value="after">复核后成绩</option><option value="before">复核前成绩</option><option value="mean_seconds">平均耗时 · 从低到高</option></select></label>
         <label id="iq-rank-scope-wrap" hidden><span id="iq-rank-scope-label">站点</span><select id="iq-rank-scope" aria-label="排行榜站点"></select></label>
-        <label class="iq-rank-condition">题库版本<select id="iq-rank-cohort" aria-label="排行榜题库版本" disabled><option value="">暂无有效成绩</option></select></label>
+        <label id="iq-rank-version-wrap" class="iq-rank-condition" hidden>题库版本<select id="iq-rank-cohort" aria-label="排行榜题库版本" disabled><option value="">暂无有效成绩</option></select></label>
       </div>
       <p id="iq-rank-condition" class="muted iq-rank-note"></p>
       <div id="iq-rank-error" class="iq-error" role="alert" hidden></div>
