@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pelican Bench · 模型评测</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/settings.css">
+<link rel="stylesheet" href="/static/iq.css">
+<link rel="stylesheet" href="/static/model-actions.css">
+<link rel="stylesheet" href="/static/workspace.css">
+<link rel="stylesheet" href="/static/capacity.css">
+</head>
+<body>
+<a class="skip-link" href="#main">跳到内容</a>
+<header class="top">
+  <a class="brand" href="/#home"><span class="brand-icon"><i data-lucide="chart-no-axes-combined" aria-hidden="true"></i></span><span><strong>Pelican Bench</strong><small>模型评测工作区</small></span></a>
+  <nav aria-label="主导航">
+    <span class="nav-caption">评测</span>
+    <a class="tab active" data-view="home" href="#home" aria-current="page"><i data-lucide="layout-grid" aria-hidden="true"></i><span>模型画廊</span></a>
+    <a class="tab" data-view="iq" href="#iq"><i data-lucide="brain" aria-hidden="true"></i><span>IQ 评测</span></a>
+    <a class="tab" href="/static/engineering.html"><i data-lucide="code-xml" aria-hidden="true"></i><span>工程评测</span></a>
+    <a class="tab" data-view="performance" href="#performance"><i data-lucide="gauge" aria-hidden="true"></i><span>性能测评</span></a>
+    <span class="nav-caption">工作区</span>
+    <a class="tab" data-view="run" href="#run"><i data-lucide="play" aria-hidden="true"></i><span>SVG 跑批</span></a>
+    <a class="tab" data-view="history" href="#history"><i data-lucide="history" aria-hidden="true"></i><span>运行历史</span></a>
+    <a class="tab" data-view="settings" href="#settings"><i data-lucide="settings-2" aria-hidden="true"></i><span>设置</span></a>
+  </nav>
+  <div class="workspace-label"><i data-lucide="monitor" aria-hidden="true"></i><span>本地工作区<small>Pelican Bench</small></span></div>
+</header>
+
+<main id="main" tabindex="-1">
+  <!-- 每个组合展示最新成功出图，失败记录在历史版本中保留。 -->
+  <section id="view-home" class="view">
+    <div class="page-heading home-heading">
+      <div><h2>模型画廊</h2><p class="page-description">SVG 生成结果 · 每个站点与模型的最新成功版本</p></div>
+      <span id="gallery-status" class="page-status">加载中…</span>
+    </div>
+    <div class="toolbar surface-toolbar">
+      <label class="search-field"><i data-lucide="search" aria-hidden="true"></i><input id="gallery-search" type="search" placeholder="搜索站点或模型" aria-label="搜索画廊站点或模型"></label>
+      <div class="toolbar-main"><label class="inline"><select id="gallery-group" aria-label="卡片分组">
+          <option value="site">按站点</option>
+          <option value="model">按模型</option>
+          <option value="none">不分组</option>
+        </select></label></div>
+      <div class="toolbar-actions"><label class="inline toggle-label"><input type="checkbox" id="gallery-auto" role="switch" checked> 自动刷新</label><button id="btn-gallery-refresh" data-icon="refresh-cw" data-icon-only="true">刷新</button></div>
+    </div>
+    <div id="gallery" class="gallery"></div>
+    <p id="gallery-empty" class="empty-state" hidden>没有匹配的站点或模型</p>
+  </section>
+
+  <!-- 跑批：选模型 + 看进度 -->
+  <section id="view-run" class="view hidden">
+    <div class="page-heading">
+      <div><h2>SVG 跑批</h2><p class="page-description">使用同一提示词生成 SVG，比较各模型的输出与耗时。</p></div>
+      <div class="run-summary"><strong id="pick-count">0</strong><span>个已选</span></div>
+    </div>
+    <div class="toolbar surface-toolbar run-toolbar">
+      <button id="btn-load-models" data-icon="refresh-cw">拉取模型列表</button><span class="toolbar-divider"></span><button id="btn-select-all">全选</button><button id="btn-select-none">清空</button><span class="grow"></span><button id="btn-start" class="primary" disabled>开始跑批</button>
+    </div>
+    <p id="run-error" role="alert" class="run-error" hidden></p>
+    <div id="model-picker" class="picker">
+      <p class="muted">在设置中添加站点后，拉取模型列表。</p>
+    </div>
+
+    <div id="progress" class="hidden run-progress">
+      <div class="progress-heading"><div><p class="page-eyebrow">实时进度</p><strong id="progress-text" role="status">准备中…</strong></div>
+        <a id="report-link" href="#" target="_blank" class="button hidden">打开完整报告</a>
+      </div>
+      <div class="track" id="run-meter" role="progressbar" aria-label="跑批进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-fill"></div></div>
+      <div id="live-table"></div>
+    </div>
+  </section>
+
+  <section id="view-iq" class="view hidden" aria-labelledby="iq-title">
+    <div class="page-heading">
+      <div><h2 id="iq-title">推理评测</h2><p class="page-description">BBEH Mini · ARC-AGI-2 · 各基准独立排名，不换算人类 IQ</p></div>
+    </div>
+    <div id="iq-error" class="iq-error" role="alert" hidden></div>
+    <div class="bench-tabs" data-panel-tabs="iq" role="tablist" aria-label="IQ 评测视图">
+      <button id="iq-tab-rank" role="tab" aria-controls="iq-panel-rank" data-panel="rank" aria-selected="true">排行榜</button>
+      <button id="iq-tab-setup" role="tab" aria-controls="iq-panel-setup" data-panel="setup" aria-selected="false" tabindex="-1">新建评测</button>
+      <button id="iq-tab-records" role="tab" aria-controls="iq-panel-records" data-panel="records" aria-selected="false" tabindex="-1">运行记录</button>
+    </div>
+    <details id="iq-review-settings" class="iq-review-settings">
+      <summary>复核设置 <span id="iq-judge-current" class="muted" aria-live="polite"></span></summary>
+      <div class="iq-review-controls">
+        <label>复核站点<select id="iq-judge-site" aria-label="复核站点" disabled></select></label>
+        <label>复核模型<select id="iq-judge-model" aria-label="复核模型" disabled></select></label>
+        <button id="iq-judge-refresh" type="button" data-icon="refresh-cw" data-icon-only="true" title="刷新复核模型" disabled>刷新复核模型</button>
+        <button id="iq-judge-save" type="button" data-icon="save" disabled>保存复核设置</button>
+      </div>
+      <p id="iq-judge-save-status" class="muted iq-rank-note" role="status" aria-live="polite"></p>
+      <p class="muted iq-rank-note">仅复核未判对的完整回答，复核完成后发布最终成绩。复核会消耗模型额度。</p>
+      <p id="iq-review-error" class="iq-error" role="alert" hidden></p>
+    </details>
+    <button id="iq-active-run" class="run-indicator" data-open-panel="iq:records" hidden></button>
+    <section id="iq-panel-rank" class="iq-leaderboard bench-panel" role="tabpanel" aria-labelledby="iq-tab-rank" data-panel-group="iq" data-panel="rank">
+      <div class="metric-strip" aria-label="推理榜单概览"><div><span>入榜组合</span><strong id="iq-metric-count">—</strong></div><div><span id="iq-metric-label">最高正确率</span><strong id="iq-metric-score">—</strong></div><div><span>题集规模</span><strong id="iq-metric-suite">—</strong></div></div>
+      <div class="iq-model-heading"><h3 id="iq-rank-title">推理长期榜</h3><div class="iq-actions">
+        <div id="iq-rank-views" class="iq-view-toggle" role="group" aria-label="榜单展示方式">
+          <button id="iq-view-bars" type="button" data-icon="chart-bar" data-icon-only="true" title="横向条形图" aria-label="横向条形图" aria-pressed="true">横向条形图</button>
+          <button id="iq-view-table" type="button" data-icon="table-2" data-icon-only="true" title="表格" aria-label="表格" aria-pressed="false">表格</button>
+        </div>
+        <button id="iq-rank-refresh" type="button" data-icon="refresh-cw" data-icon-only="true">刷新榜单</button>
+      </div></div>
+      <fieldset id="iq-rank-modes" class="iq-segments" aria-label="排名范围">
+        <label><input type="radio" name="iq-rank-mode" value="all" checked><span>全部站点 · 全部模型</span></label>
+        <label><input type="radio" name="iq-rank-mode" value="site"><span>按站点</span></label>
+        <label><input type="radio" name="iq-rank-mode" value="model"><span>按模型</span></label>
+      </fieldset>
+      <div class="iq-rank-filters">
+        <label>基准<select id="iq-rank-benchmark" aria-label="排行榜基准"><option value="bbeh-mini">BBEH Mini</option><option value="arc-agi-2">ARC-AGI-2 · 公开集文本模式</option><option value="foundation">自编基础题</option></select></label>
+        <label>评分<select id="iq-rank-scoring" aria-label="排行榜评分方式"><option value="reviewed">最终成绩（复核后）</option><option value="official">原始评分（留档）</option><option value="normalized">规范化评分（留档）</option></select></label>
+        <label id="iq-rank-scope-wrap" hidden><span id="iq-rank-scope-label">站点</span><select id="iq-rank-scope" aria-label="排行榜站点"></select></label>
+        <label class="iq-rank-condition">题库版本<select id="iq-rank-cohort" aria-label="排行榜题库版本" disabled><option value="">暂无有效成绩</option></select></label>
+      </div>
+      <p id="iq-rank-condition" class="muted iq-rank-note"></p>
+      <div id="iq-rank-error" class="iq-error" role="alert" hidden></div>
+      <div id="iq-rank-table" class="iq-table-scroll"></div>
+      <nav id="iq-rank-pagination" class="iq-pagination" aria-label="排行榜分页" hidden>
+        <span id="iq-rank-range" role="status" aria-live="polite"></span>
+        <div class="iq-page-controls">
+          <label>每页<select id="iq-rank-page-size" aria-label="排行榜每页条数"><option value="10">10 条</option><option value="20">20 条</option><option value="50">50 条</option></select></label>
+          <button id="iq-rank-prev" type="button" title="上一页" aria-label="排行榜上一页">&larr;</button>
+          <label>第<input id="iq-rank-page" type="number" min="1" max="1" step="1" value="1" aria-label="排行榜页码">/ <span id="iq-rank-pages">1</span> 页</label>
+          <button id="iq-rank-next" type="button" title="下一页" aria-label="排行榜下一页">&rarr;</button>
+        </div>
+      </nav>
+      <p id="iq-rank-status" class="muted iq-rank-note" role="status" aria-live="polite">正在读取排行榜…</p>
+    </section>
+    <div id="iq-panel-setup" class="iq-setup bench-panel" role="tabpanel" aria-labelledby="iq-tab-setup" data-panel-group="iq" data-panel="setup" hidden>
+      <fieldset id="iq-fields">
+        <h3 class="section-title">评测参数</h3>
+        <div class="iq-options">
+          <label>题集<select id="iq-suite"></select></label>
+          <label>每题次数<input id="iq-repeats" type="number" value="1" min="1" max="20" step="1" required></label>
+          <label>输出上限<input id="iq-tokens" type="number" value="32768" min="128" max="262144" step="1" required></label>
+          <label>请求总时限 / 秒<input id="iq-timeout" type="number" value="600" min="10" max="1800" step="1" required></label>
+          <label>并发数<input id="iq-concurrency" type="number" value="32" min="1" max="200" step="1" required></label>
+          <label>统一推理模式<select id="iq-thinking"><option value="default">上游默认</option><option value="enabled">请求开启</option><option value="disabled">请求关闭</option></select></label>
+        </div>
+        <p id="iq-suite-description" class="muted iq-rank-note"></p>
+        <div class="iq-model-heading"><h3>参评模型</h3><div class="iq-actions">
+          <button id="iq-select-all" type="button" title="选择所有站点的全部模型">全选</button>
+          <button id="iq-select-none" type="button" title="取消所有模型的选择">取消全选</button>
+          <button id="iq-load-models" type="button" data-icon="refresh-cw">拉取模型列表</button>
+        </div></div>
+        <div id="iq-models" class="iq-models"><p class="muted">正在读取站点配置…</p></div>
+      </fieldset>
+      <div class="iq-launch"><span id="iq-plan" role="status">尚未选择模型</span><button id="iq-start" class="primary" data-icon="play" disabled><span>开始评测</span></button></div>
+    </div>
+    <section id="iq-panel-records" class="bench-panel" role="tabpanel" aria-labelledby="iq-tab-records" data-panel-group="iq" data-panel="records" hidden>
+    <div class="iq-results-heading"><h3>评测记录</h3><div class="iq-actions">
+      <select id="iq-history" aria-label="选择历史评测"><option value="">暂无评测</option></select>
+      <button id="iq-refresh" type="button" data-icon="refresh-cw" data-icon-only="true">刷新</button>
+      <button id="iq-export" type="button" data-icon="download" disabled>导出 JSON</button>
+      <button id="iq-retry" type="button" data-icon="refresh-cw" hidden><span>重试接口失败</span></button>
+      <button id="iq-retry-source" type="button" data-icon="arrow-left" hidden>原始记录</button>
+      <button id="iq-stop" type="button" class="danger" hidden>停止</button>
+    </div></div>
+    <div id="iq-retry-confirm" class="iq-retry-confirm" role="group" aria-labelledby="iq-retry-confirm-title" hidden>
+      <strong id="iq-retry-confirm-title">确认重试接口失败</strong>
+      <p id="iq-retry-confirm-description"></p>
+      <div class="iq-actions">
+        <button id="iq-retry-confirm-submit" type="button" class="primary" data-icon="play">确认重试</button>
+        <button id="iq-retry-confirm-cancel" type="button">取消</button>
+      </div>
+    </div>
+    <div id="iq-retry-feedback" class="iq-retry-feedback" role="status" aria-live="polite" hidden>
+      <strong id="iq-retry-feedback-title"></strong>
+      <p id="iq-retry-feedback-description"></p>
+    </div>
+    <section id="iq-retry-items" class="iq-retry-items" aria-labelledby="iq-retry-items-title" hidden>
+      <div class="iq-results-heading"><h3 id="iq-retry-items-title">本轮重试明细</h3><span id="iq-retry-items-count" class="muted"></span></div>
+      <div id="iq-retry-items-table" class="iq-table-scroll"></div>
+    </section>
+    <div id="iq-status" class="iq-status" role="status" aria-live="polite">尚无评测记录</div>
+    <progress id="iq-progress" value="0" max="1" aria-label="评测进度" hidden></progress>
+    <div id="iq-summary" class="iq-table-scroll"></div>
+    <div id="iq-details"></div>
+    </section>
+  </section>
+
+  <!-- 设置分区保留全部控件，切换只改变可见性，未保存的输入不会丢失。 -->
+  <section id="view-performance" class="view hidden" aria-labelledby="performance-title">
+    <div class="page-heading">
+      <div><h2 id="performance-title">性能测评</h2><p class="page-description">输出吞吐、首字延迟、token 用量与容量检测</p></div>
+    </div>
+    <div id="performance-tabs" class="performance-tabs" role="tablist" aria-label="性能测评视图" hidden></div>
+    <section id="performance-library" aria-label="性能成绩与历史" hidden></section>
+    <div id="performance-probe"></div>
+  </section>
+
+  <section id="view-settings" class="view hidden">
+    <div class="settings-heading">
+      <div><h2>设置</h2>
+        <p class="settings-description">管理模型连接、生成参数和费用估算。</p></div>
+      <span class="settings-local"><span aria-hidden="true">●</span> 本机配置</span>
+    </div>
+    <div class="settings-layout">
+      <nav class="settings-nav" aria-label="设置分区">
+        <button type="button" data-settings="general" aria-current="page" aria-controls="settings-general"><span class="settings-icon" aria-hidden="true"><i data-lucide="sliders-horizontal"></i></span><span>运行参数<small>输出与请求</small></span></button>
+        <button type="button" data-settings="sites" aria-controls="settings-sites"><span class="settings-icon" aria-hidden="true"><i data-lucide="network"></i></span><span>模型站点<small id="settings-site-count">连接与覆盖</small></span></button>
+        <button type="button" data-settings="prompt" aria-controls="settings-prompt"><span class="settings-icon" aria-hidden="true"><i data-lucide="text-cursor-input"></i></span><span>提示词<small>定义生成内容</small></span></button>
+        <button type="button" data-settings="pricing" aria-controls="settings-pricing"><span class="settings-icon" aria-hidden="true"><i data-lucide="coins"></i></span><span>费用估算<small>模型单价</small></span></button>
+      </nav>
+      <div class="settings-main">
+        <fieldset id="settings-fields" disabled aria-label="设置内容">
+          <section id="settings-general" class="settings-panel" aria-labelledby="settings-general-title">
+            <div class="settings-section-heading"><h3 id="settings-general-title">运行参数</h3><p>所有站点的默认值。站点单独设置后，会优先使用站点的值。</p></div>
+            <div class="settings-surface settings-token">
+              <div class="settings-token-heading"><div><label for="p-maxtokens">最大输出 token</label><p>为模型推理和生成 SVG 预留足够的空间。</p></div><span class="settings-tag">全局默认</span></div>
+              <div class="settings-token-control"><input id="p-maxtokens" type="number" min="256" max="131072" step="1" required aria-describedby="token-help"><span>tokens / 次</span></div>
+              <div class="settings-presets" aria-label="输出 token 快捷值">
+                <button type="button" data-tokens="8000">8,000</button><button type="button" data-tokens="16000">16,000</button><button type="button" data-tokens="32000">32,000</button>
+              </div>
+              <p id="token-help" class="settings-footnote">遇到“输出被截断”可先试 16,000。实际支持的上限取决于模型，更多输出也可能增加耗时和费用。</p>
+            </div>
+            <div class="settings-surface settings-rows">
+              <div class="settings-row"><div><label for="p-concurrency">同时运行的模型数</label><p>并发过高可能触发站点限流。</p></div><input id="p-concurrency" type="number" min="1" max="16" step="1" required></div>
+              <div class="settings-row"><div><label for="p-timeout">请求超时</label><p>超过这个时长未完成时，结束本次请求。</p></div><div class="settings-input-unit"><input id="p-timeout" type="number" min="10" max="900" step="1" required><span>秒</span></div></div>
+              <div class="settings-row"><div><label for="p-temperature">随机程度 <span class="settings-subtle">Temperature</span></label><p>较低更稳定，较高更多样。部分模型可能忽略此参数。</p></div><input id="p-temperature" type="number" min="0" max="2" step="0.1" required></div>
+            </div>
+          </section>
+          <section id="settings-sites" class="settings-panel" hidden aria-labelledby="settings-sites-title">
+            <div class="settings-section-heading settings-heading-action"><div><h3 id="settings-sites-title">模型站点</h3><p>连接不同服务，并为每个站点设置专用参数。</p></div><button type="button" id="btn-add-site" data-icon="plus">添加站点</button></div>
+            <div id="sites"></div>
+          </section>
+          <section id="settings-prompt" class="settings-panel" hidden aria-labelledby="settings-prompt-title">
+            <div class="settings-section-heading"><h3 id="settings-prompt-title">提示词</h3><p>统一任务描述，让不同模型的结果更容易比较。</p></div>
+            <div class="settings-surface settings-editor"><div class="settings-editor-heading"><label for="p-prompt">全局提示词</label><span id="prompt-count" class="settings-subtle"></span></div>
+              <textarea id="p-prompt" rows="16" spellcheck="false" aria-describedby="prompt-help"></textarea>
+              <div class="settings-editor-footer"><p id="prompt-help">留空使用默认提示词，要求输出可循环播放的 SVG。站点专用提示词会覆盖这里的内容。</p><button type="button" id="btn-reset-prompt">恢复默认</button></div>
+            </div>
+          </section>
+          <section id="settings-pricing" class="settings-panel" hidden aria-labelledby="settings-pricing-title">
+            <div class="settings-section-heading"><h3 id="settings-pricing-title">费用估算</h3><p>美元 / 每百万 token。未配置单价的模型不计算费用。</p></div>
+            <div class="settings-surface settings-editor"><div class="settings-editor-heading"><h4>全局模型单价</h4><span class="settings-tag">可选</span></div>
+              <div id="global-pricing"></div><button type="button" id="btn-add-price" data-icon="plus">添加单价</button>
+              <p class="settings-footnote">站点内的同模型单价优先。上游未返回用量时，费用按估算 token 计算。</p>
+            </div>
+          </section>
+        </fieldset>
+        <div class="settings-savebar"><div><span id="save-hint" role="status" aria-live="polite">正在读取设置…</span><span class="settings-save-caption">保存所有分区的修改</span></div><div class="settings-save-actions"><button type="button" id="btn-discard" disabled>撤销修改</button><button type="button" id="btn-save" class="primary" disabled>保存设置</button></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 历史跑批 -->
+  <section id="view-history" class="view hidden">
+    <div class="page-heading">
+      <div><h2>运行历史</h2><p class="page-description">查看每次评测的结果和完整报告。</p></div>
+      <button id="btn-reload-history" class="secondary-action" data-icon="refresh-cw" data-icon-only="true">刷新列表</button>
+    </div>
+    <div id="history-list"></div>
+  </section>
+</main>
+
+<script src="/static/vendor/lucide.min.js"></script>
+<script src="/static/workspace.js"></script>
+<script src="/static/model-actions.js"></script>
+<script src="/static/capacity.js"></script>
+<script src="/static/performance-history.js"></script>
+<script src="/static/chatgpt.js"></script>
+<script src="/static/app.js"></script>
+<script src="/static/iq.js"></script>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>工程评测 · SWE-bench Lite</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/iq.css">
+  <link rel="stylesheet" href="/static/engineering.css">
+  <link rel="stylesheet" href="/static/workspace.css">
+</head>
+<body class="swe-page">
+<a class="skip-link" href="#main">跳到内容</a>
+<header class="top">
+  <a class="brand" href="/#home"><span class="brand-icon"><i data-lucide="chart-no-axes-combined" aria-hidden="true"></i></span><span><strong>Pelican Bench</strong><small>模型评测工作区</small></span></a>
+  <nav aria-label="主导航">
+    <span class="nav-caption">评测</span>
+    <a class="tab" href="/#home"><i data-lucide="layout-grid" aria-hidden="true"></i><span>模型画廊</span></a>
+    <a class="tab" href="/#iq"><i data-lucide="brain" aria-hidden="true"></i><span>IQ 评测</span></a>
+    <a class="tab active" href="/static/engineering.html" aria-current="page"><i data-lucide="code-xml" aria-hidden="true"></i><span>工程评测</span></a>
+    <a class="tab" href="/#performance"><i data-lucide="gauge" aria-hidden="true"></i><span>性能测评</span></a>
+    <span class="nav-caption">工作区</span>
+    <a class="tab" href="/#run"><i data-lucide="play" aria-hidden="true"></i><span>SVG 跑批</span></a>
+    <a class="tab" href="/#history"><i data-lucide="history" aria-hidden="true"></i><span>运行历史</span></a>
+    <a class="tab" href="/#settings"><i data-lucide="settings-2" aria-hidden="true"></i><span>设置</span></a>
+  </nav>
+  <div class="workspace-label"><i data-lucide="monitor" aria-hidden="true"></i><span>本地工作区<small>Pelican Bench</small></span></div>
+</header>
+<main id="main" tabindex="-1">
+  <div class="page-heading"><div><h2>工程评测</h2><p class="page-description">SWE-bench Lite · 仓库修复成功率</p></div><span id="swe-environment" class="page-status" role="status">检查环境…</span></div>
+  <div id="swe-error" class="iq-error" role="alert" hidden></div>
+  <div class="bench-tabs" data-panel-tabs="swe" role="tablist" aria-label="工程评测视图">
+    <button id="swe-tab-rank" role="tab" aria-controls="swe-panel-rank" data-panel="rank" aria-selected="true">排行榜</button>
+    <button id="swe-tab-setup" role="tab" aria-controls="swe-panel-setup" data-panel="setup" aria-selected="false" tabindex="-1">新建评测</button>
+    <button id="swe-tab-records" role="tab" aria-controls="swe-panel-records" data-panel="records" aria-selected="false" tabindex="-1">运行记录</button>
+  </div>
+  <button id="swe-active-run" class="run-indicator" data-open-panel="swe:records" hidden></button>
+  <section id="swe-panel-rank" class="iq-leaderboard bench-panel" role="tabpanel" aria-labelledby="swe-tab-rank" data-panel-group="swe" data-panel="rank">
+    <div class="metric-strip" aria-label="工程榜概览"><div><span>入榜组合</span><strong id="swe-metric-count">—</strong></div><div><span>最高修复成功率</span><strong id="swe-metric-score">—</strong></div><div><span>任务集规模</span><strong id="swe-metric-suite">—</strong></div></div>
+    <div class="iq-model-heading"><h3 id="swe-rank-title">工程排行榜</h3><button id="swe-refresh" data-icon="refresh-cw" data-icon-only="true">刷新</button></div>
+    <div class="iq-rank-filters">
+      <label>排名范围<select id="swe-scope"><option value="all">全部站点 · 全部模型</option><option value="site">按站点</option><option value="model">按模型</option></select></label>
+      <label id="swe-filter-wrap" hidden>筛选<select id="swe-filter"></select></label>
+      <label class="iq-rank-condition">评测条件<select id="swe-cohort"><option value="">暂无成绩</option></select></label>
+    </div>
+    <div id="swe-board" class="iq-table-scroll"></div>
+    <nav id="swe-pagination" class="iq-pagination" aria-label="工程榜分页" hidden><span id="swe-range" role="status"></span><div class="iq-page-controls">
+      <label>每页<select id="swe-page-size"><option>10</option><option>20</option><option>50</option></select></label>
+      <button id="swe-prev" title="上一页" aria-label="上一页">&larr;</button><span id="swe-page-number"></span><button id="swe-next" title="下一页" aria-label="下一页">&rarr;</button>
+    </div></nav>
+  </section>
+  <section id="swe-panel-setup" class="swe-setup bench-panel" role="tabpanel" aria-labelledby="swe-tab-setup" data-panel-group="swe" data-panel="setup" hidden>
+    <h3 id="swe-setup-title" class="section-title">评测参数</h3>
+    <form id="swe-form"><fieldset id="swe-fields">
+      <div class="iq-options">
+        <label>任务集<select id="swe-suite"><option value="smoke">3 题离线试跑 · Flask</option><option value="lite">完整 300 题</option></select></label>
+        <label>每题次数<input id="swe-repeats" type="number" min="1" max="5" value="1" required></label>
+        <label>每题最多步数<input id="swe-steps" type="number" min="1" max="250" value="80" required></label>
+        <label>每步输出上限<input id="swe-tokens" type="number" min="256" max="262144" value="8192" required></label>
+        <label>解题时间 / 秒<input id="swe-timeout" type="number" min="60" max="7200" value="1800" required></label>
+        <label>单次请求超时 / 秒<input id="swe-request-timeout" type="number" min="30" max="3600" value="600" required></label>
+        <label>单步失败重试次数<input id="swe-request-retries" type="number" min="0" max="5" value="2" required></label>
+      </div>
+      <div class="iq-model-heading"><h3>参评模型</h3><div class="iq-actions"><button id="swe-all" type="button">全选</button><button id="swe-none" type="button">清空</button><button id="swe-load" type="button" data-icon="refresh-cw">拉取模型列表</button></div></div>
+      <label class="search-field model-search"><i data-lucide="search" aria-hidden="true"></i><input id="swe-model-search" type="search" placeholder="搜索站点或模型" aria-label="搜索工程评测模型"></label>
+      <div id="swe-models" class="iq-models"></div>
+      <p id="swe-model-empty" class="empty-state" hidden>没有匹配的模型</p>
+    </fieldset><div class="iq-launch"><span id="swe-plan" role="status">尚未选择模型</span><button id="swe-start" class="primary" data-icon="play" disabled>开始工程评测</button></div></form>
+  </section>
+  <section id="swe-panel-records" class="swe-records bench-panel" role="tabpanel" aria-labelledby="swe-tab-records" data-panel-group="swe" data-panel="records" hidden>
+    <div class="iq-results-heading"><h3 id="swe-records-title">运行记录</h3><div class="iq-actions"><select id="swe-history" aria-label="运行记录"></select><button id="swe-record-refresh" data-icon="refresh-cw" data-icon-only="true">刷新运行记录</button><button id="swe-export" data-icon="download" disabled>导出 JSON</button><button id="swe-stop" class="danger" hidden>停止评测</button></div></div>
+    <p id="swe-status" role="status">暂无运行记录</p><progress id="swe-progress" max="1" value="0" hidden></progress>
+    <div id="swe-summary" class="iq-table-scroll"></div><div id="swe-results"></div>
+  </section>
+</main>
+<script src="/static/vendor/lucide.min.js"></script>
+<script src="/static/workspace.js"></script>
+<script src="/static/engineering.js"></script>
+</body>
+</html>

@@ -1,0 +1,47 @@
+.model-actions { display: flex; gap: 8px; margin-top: auto; padding-top: 6px; }
+.model-actions button, .model-history button {
+  font: inherit; font-size: .75rem; min-height: 2.5rem; padding: .45rem .75rem; border-radius: .6rem; cursor: pointer;
+  touch-action: manipulation; transition: background-color 120ms ease, transform 100ms ease-out;
+  border: 1px solid #d3d6da; background: #fff; color: #1c1e21;
+}
+.model-actions button:hover:not(:disabled), .model-history button:hover { background: #f0f2f5; }
+.model-actions button:disabled { opacity: .5; cursor: not-allowed; }
+.model-action-status { font-size: 12px; color: #666; overflow-wrap: anywhere; }
+.model-action-status:empty { display: none; }
+.model-action-status a, .model-report-link { color: #1c64f2; }
+.card > .model-actions, .card > .model-action-status { margin: 8px 12px; }
+.model-history {
+  width: min(720px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); overflow: auto;
+  padding: 20px; border: 1px solid #d3d6da; border-radius: 18px; box-shadow: 0 24px 80px #0003; background: #fff; color: #1c1e21;
+  font: 14px/1.5 -apple-system, 'Segoe UI', 'PingFang SC', sans-serif;
+}
+.model-history::backdrop { background: rgb(0 0 0 / .4); }
+.model-history-head { display: flex; align-items: start; gap: 16px; justify-content: space-between; }
+.model-history-head h2 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.model-history-head button { flex-shrink: 0; }
+.model-hint { font-size: 12px; color: #777; }
+.model-history select { width: 100%; min-width: 0; padding: 8px; font: inherit; margin-bottom: 12px; }
+.model-history-preview { height: min(360px, 45dvh); background: #fafbfc; color: #555; border: 1px solid #ebedf0; border-radius: 8px; overflow: hidden; }
+.model-history-preview[hidden] { display: none; }
+.model-version-detail { font-size: 12px; overflow-wrap: anywhere; }
+@media (prefers-color-scheme: dark) {
+  .model-history { background: #212225; color: #e6e6e6; border-color: #34363a; }
+  .model-actions button, .model-history button, .model-history select { background: #2a2c30; border-color: #3d4045; color: #e6e6e6; }
+  .model-actions button:hover:not(:disabled), .model-history button:hover { background: #33363c; }
+  .model-action-status, .model-hint { color: #aaa; }
+  .model-action-status a, .model-report-link { color: #8ab0ff; }
+}
+
+.model-actions button:active:not(:disabled), .model-history button:active { transform: scale(.97); }
+.model-actions button:focus-visible, .model-history :is(button, select, a):focus-visible { outline: 3px solid #0071e3; outline-offset: 3px; }
+@media (max-width: 640px) {
+  .model-actions button, .model-history button, .model-history select { min-height: 2.75rem; }
+  .model-actions { flex-wrap: wrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .model-actions button, .model-history button { transition: none; }
+  .model-actions button:active:not(:disabled), .model-history button:active { transform: none; }
+}
+@media (prefers-contrast: more) {
+  .model-history, .model-actions button, .model-history button { border-color: currentColor; }
+}
