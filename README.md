@@ -8,26 +8,33 @@ macOS 或 Linux 已安装 Homebrew 后，执行：
 
 ```sh
 brew install dahuaxiya/tap/pelican-bench
-pelican
+pelican-bench
 ```
 
 Homebrew 自动安装 Python，不需要 npm、uv 或手动准备 Python 环境。这里使用项目维护的 Tap，不是 Homebrew Core 收录。
 
-0.1.1 起提供 pelican 命令，同时保留旧版 pelican-bench 命令。两者使用相同的数据目录与实例锁。
+从 0.2.0 起统一使用 pelican-bench 命令，不再安装 pelican 别名，避免与同名博客生成器冲突。
 
 启动后自动打开本地网页，默认端口 8780。在设置中填写自己的模型地址和凭据，再选择模型开始测试。
 
 ```sh
-pelican --version
-pelican doctor
-pelican --no-browser
-pelican --port 9000
-pelican --data-dir ./my-bench-data
+pelican-bench --version
+pelican-bench doctor
+pelican-bench --no-browser
+pelican-bench --port 9000
+pelican-bench --data-dir ./my-bench-data
 ```
 
-同一数据目录只运行一个后端。再次输入 pelican 会打开已有实例。端口被其他程序占用时提示错误，不会终止其他程序。Ctrl+C 停止本次服务；关闭网页后，终端中的进程仍可继续测试。
+同一数据目录只运行一个后端。再次输入 pelican-bench 会打开已有实例。端口被其他程序占用时提示错误，不会终止其他程序。Ctrl+C 停止本次服务；关闭网页后，终端中的进程仍可继续测试。
 
-Homebrew 的博客生成器也叫 pelican，两者会安装同名命令，因此配方声明了冲突，不会覆盖已有命令。
+也保留 npm 安装入口，需要 Node.js 20+ 和 Python 3.10+。npm 注册表尚未发布，请使用 GitHub Release 提供的安装包：
+
+```sh
+npm install -g ./pelican-bench-0.2.0.tgz
+pelican-bench
+```
+
+Homebrew 直接调用 Python，npm 通过 Node 启动同一个 Python 后端。两种入口共用用户数据目录和实例锁，切换渠道不需要迁移成绩。请选择一种全局安装方式，避免两个包管理器争用同名命令。
 
 ## 数据与升级
 
@@ -59,9 +66,9 @@ brew uninstall pelican-bench
 先停止该数据目录的服务，再按需准备题库或工程环境：
 
 ```sh
-pelican setup-iq bbeh
-pelican setup-iq arc
-pelican setup-engineering
+pelican-bench setup-iq bbeh
+pelican-bench setup-iq arc
+pelican-bench setup-engineering
 ```
 
 准备题库和工程环境会下载公开文件，不会发起模型推理。固定版本、题库原文及原许可证会保存在本地。也可以使用 --archive 或 --parquet 指定预先下载的文件。

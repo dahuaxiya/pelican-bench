@@ -1,10 +1,10 @@
 {
   "name": "pelican-bench",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Benchmark model endpoints from your own computer with a local web UI.",
   "license": "MIT",
   "engines": { "node": ">=20" },
-  "bin": { "pelican": "bin/pelican-bench.mjs", "pelican-bench": "bin/pelican-bench.mjs" },
+  "bin": { "pelican-bench": "bin/pelican-bench.mjs" },
   "scripts": {
     "start": "node bin/pelican-bench.mjs",
     "test:cli": "python3 -B -m unittest discover -s tests -v",

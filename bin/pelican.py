@@ -29,12 +29,12 @@ def main():
     parser.add_argument("--help", "-h", action="store_true")
     args, remaining = parser.parse_known_args()
     if args.version:
-        print("pelican-bench " + json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"])
+        print(json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"])
         return
     if args.help:
         print("""Pelican Bench - local model benchmarks
 
-Usage: pelican [start|doctor|setup-iq|setup-engineering] [options]
+Usage: pelican-bench [start|doctor|setup-iq|setup-engineering] [options]
   start                       Open the local web UI (default)
   doctor [--json]             Check local dependencies without model calls
   setup-iq bbeh|arc            Download a pinned official question set
@@ -56,7 +56,7 @@ Set PELICAN_BENCH_DOCKER_CONTEXT to select an engineering Docker context.""")
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     os.environ["PYTHONUTF8"] = "1"
     sys.path.insert(0, str(ROOT))
-    sys.argv = ["pelican", *remaining]
+    sys.argv = ["pelican-bench", *remaining]
     runpy.run_path(str(ROOT / "local_launcher.py"), run_name="__main__")
 
 

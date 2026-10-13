@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,22 +34,31 @@ class DistributionTests(unittest.TestCase):
         """运行短命令并保留失败诊断；参数直接传给解释器，不经过 shell。
 
         Args:
-            args: pelican CLI 参数；不会触发付费模型调用。
+            args: pelican-bench CLI 参数；不会触发付费模型调用。
         Returns:
             子进程完成结果。
         """
         return subprocess.run([sys.executable, str(ENTRY), *args], env=self.env,
                               cwd=self.home, capture_output=True, text=True, timeout=30)
 
-    def launch(self):
-        """启动本次测试的服务并核对随机实例 ID，返回前确保 HTTP 已经就绪。"""
+    def launch(self, node_entry=None):
+        """启动 Python 或已安装的 npm 入口，核对实例 ID 后返回。
+
+        Args:
+            node_entry: 已安装 npm 包的入口路径；为空时直接使用 Python 入口。
+        Returns:
+            本次子进程、回环地址和已验证的运行时元数据。
+        """
         log = open(self.home / "server.log", "ab")
         self.addCleanup(log.close)
         # CI 冷启动较慢时保留线程栈，区分解释器导入与 HTTP 未就绪，避免只得到空日志。
         bootstrap = ("import faulthandler,runpy,sys; "
                      "faulthandler.dump_traceback_later(30,repeat=True); "
                      "entry=sys.argv.pop(1); runpy.run_path(entry,run_name='__main__')")
-        process = subprocess.Popen([sys.executable, "-u", "-c", bootstrap, str(ENTRY), "--port", "0", "--no-browser"],
+        # 两个入口必须共用同一个锁；不能仅分别验证启动后就假定跨渠道切换安全。
+        entry_command = ([shutil.which("node"), str(node_entry)] if node_entry is not None else
+                         [sys.executable, "-u", "-c", bootstrap, str(ENTRY)])
+        process = subprocess.Popen([*entry_command, "--port", "0", "--no-browser"],
                                    cwd=self.home, env=self.env, stdout=log, stderr=log)
         self.addCleanup(self.stop, process)
         deadline = time.monotonic() + 90
@@ -98,9 +108,9 @@ class DistributionTests(unittest.TestCase):
 
     def test_help_doctor_and_invalid_options(self):
         """帮助与依赖检查不创建数据；显式目录优先，未知参数不启动服务。"""
-        self.assertIn("Usage: pelican", self.command("--help").stdout)
+        self.assertIn("Usage: pelican-bench", self.command("--help").stdout)
         version = json.loads((ROOT / "package.json").read_text())["version"]
-        self.assertEqual(self.command("--version").stdout.strip(), "pelican-bench " + version)
+        self.assertEqual(self.command("--version").stdout.strip(), version)
         info = self.command("doctor", "--json", "--data-dir", str(self.home / "override"))
         self.assertEqual(info.returncode, 0, info.stderr)
         self.assertEqual(json.loads(info.stdout)["data_directory"], str(self.home / "override"))
@@ -108,6 +118,47 @@ class DistributionTests(unittest.TestCase):
         self.assertFalse((self.home / "override").exists())
         self.assertNotEqual(self.command("--unknown").returncode, 0)
         self.assertNotEqual(self.command("--port", "65536").returncode, 0)
+
+    @unittest.skipUnless(shutil.which("node") and shutil.which("npm"), "npm channel requires Node.js")
+    def test_npm_install_and_cross_channel_single_instance(self):
+        """安装真正 npm 包，验证双向复用同一实例，且只暴露 pelican-bench 命令。"""
+        packed = subprocess.run(["npm", "pack", "--json", "--pack-destination", str(self.home)],
+                                cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(packed.returncode, 0, packed.stderr)
+        package = json.loads(packed.stdout)[0]
+        manifest = json.loads((ROOT / "package.json").read_text())
+        # npm 自动包含 README、LICENSE 和 package.json，其余必须精确符合发布白名单。
+        self.assertEqual({item["path"] for item in package["files"]},
+                         set(manifest["files"]) | {"README.md", "LICENSE", "package.json"})
+        prefix = self.home / "npm installation"
+        install = subprocess.run(["npm", "install", "--prefix", str(prefix), "--offline",
+                                  "--ignore-scripts", "--no-audit", "--no-fund",
+                                  str(self.home / package["filename"])],
+                                 env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(install.returncode, 0, install.stderr)
+        binary = prefix / "node_modules/.bin/pelican-bench"
+        self.assertTrue(binary.exists())
+        self.assertFalse((prefix / "node_modules/.bin/pelican").exists())
+        version = subprocess.run([str(binary), "--version"], env=self.env,
+                                 capture_output=True, text=True, timeout=10)
+        self.assertEqual(version.returncode, 0, version.stderr)
+        self.assertEqual(version.stdout.strip(), manifest["version"])
+
+        process, _, state = self.launch()
+        repeated = subprocess.run([str(binary), "--no-browser"], env=self.env,
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertIn("Already running:", repeated.stdout)
+        self.assertEqual(json.loads((self.data / "runtime.json").read_text())["instance"], state["instance"])
+        self.stop(process)
+
+        # 反向验证 npm 启动后 Python 入口也复用，防止只修好其中一个入口的判断逻辑。
+        node_entry = prefix / "node_modules/pelican-bench/bin/pelican-bench.mjs"
+        _, _, state = self.launch(node_entry=node_entry)
+        repeated = self.command("--no-browser")
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertIn("Already running:", repeated.stdout)
+        self.assertEqual(json.loads((self.data / "runtime.json").read_text())["instance"], state["instance"])
 
     def test_local_model_history_and_single_instance(self):
         """模拟一次流式测速，验证请求来自回环、历史可恢复且重复启动不另起服务。"""
