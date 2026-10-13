@@ -38,8 +38,11 @@ class DistributionTests(unittest.TestCase):
         Returns:
             子进程完成结果。
         """
+        # 后台启动器自身最多等 60 秒。macOS CI 的冷导入可能超过 30 秒，
+        # 测试必须等它返回实际结果，不能更早杀掉父进程而遗留后台子进程。
+        timeout = 90 if args and args[0] in ("start", "restart") else 30
         return subprocess.run([sys.executable, str(ENTRY), *args], env=self.env,
-                              cwd=self.home, capture_output=True, text=True, timeout=30)
+                              cwd=self.home, capture_output=True, text=True, timeout=timeout)
 
     def launch(self, node_entry=None):
         """启动 Python 或已安装的 npm 入口，核对实例 ID 后返回。
@@ -125,9 +128,9 @@ class DistributionTests(unittest.TestCase):
 
     def test_background_control_and_private_stop(self):
         """后台服务校验身份和停机令牌；重复启动复用，重启更换身份，状态查询不泄露令牌。"""
+        self.addCleanup(self.command, "stop")
         launched = self.command("start", "--background", "--port", "0", "--no-browser", "--json")
         self.assertEqual(launched.returncode, 0, launched.stderr)
-        self.addCleanup(self.command, "stop")
         url = json.loads(launched.stdout)["url"].split("/#")[0]
         metadata = json.loads((self.data / "runtime.json").read_text())
         self.assertEqual((self.data / "runtime.json").stat().st_mode & 0o777, 0o600)
