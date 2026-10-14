@@ -18,18 +18,24 @@ import statistics
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any
 
 import config
 import iq_tasks
 import llm
+from query_cache import QueryCache, code_revision
 
 ROOT = os.path.join(config.ROOT, "iq-runs")
 _RUNS: dict[str, "Run"] = {}
 _LOCK = threading.RLock()
 _VALID_ID = re.compile(r"^[a-f0-9]{32}$")
 AUTO_RETRY_DELAYS = (1, 2, 4)
+_SUMMARY_CACHE: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
+_SUMMARY_LOCK = threading.RLock()
+_DISK_SUMMARIES = QueryCache(entries=256)
+_SUMMARY_CODE = None
 
 
 def _integer(value: Any, low: int, high: int, name: str) -> int:
@@ -232,11 +238,13 @@ class Run:
         self.lock = threading.RLock()
         self.stop = threading.Event()
 
-    def snapshot(self, full: bool = False, *, reviews: bool = True) -> dict[str, Any]:
+    def snapshot(self, full: bool = False, *, reviews: bool = True,
+                 review_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
         """生成线程一致的快照；轮询只回摘要，完整回答按需获取。
 
         @param full 是否包含题干、答案和原始回答
         @param reviews 是否合并复核结论；内部提交复核时关闭，避免递归和重复扫描
+        @param review_snapshot 历史列表共享的本批复核快照，省略时自行读取
         @return 独立副本，不能通过修改它改变运行状态
         """
         with self.lock:
@@ -247,7 +255,7 @@ class Run:
         iq_scoring.annotate(result)
         if reviews:
             import iq_review
-            iq_review.annotate(result)
+            iq_review.annotate(result, review_snapshot)
         _annotate_retry_progress(result)
         result["retryable_errors"] = sum(r["status"] == "service_error" and not r["response_ok"] for r in result["results"])
         if result.get("retry") and result["retry"].get("mode") != "in_place":
@@ -703,27 +711,67 @@ def _execute_round(run: Run) -> bool:
         return again
 
 
-def get(run_id: str, full: bool = False, *, reviews: bool = True) -> dict[str, Any] | None:
+def get(run_id: str, full: bool = False, *, reviews: bool = True,
+        review_snapshot: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """读取内存或磁盘批次；进程重启遗留的运行状态标为中断，绝不自动补考。
 
     @param run_id 合法批次 ID
     @param full 是否包含逐题回答
     @param reviews 是否合并复核结论；复核调度内部关闭，查询默认开启
+    @param review_snapshot 历史查询预先读取的复核快照，省略时自行读取
     @return 批次快照；不存在时为 None
     """
+    global _SUMMARY_CODE
     path = _path(run_id)
     with _LOCK:
         run = _RUNS.get(run_id)
     if run:
-        return run.snapshot(full, reviews=reviews)
+        # 在途运行仍读取加锁的实时数据，不能用磁盘摘要掩盖尚未持久化的重试进度。
+        return run.snapshot(full, reviews=reviews, review_snapshot=review_snapshot)
     if not os.path.isfile(path):
         return None
-    with open(path, encoding="utf-8") as stream:
-        data = json.load(stream)
-    if data["status"] in ("running", "stopping"):
-        data["status"] = "interrupted"
-        data["error"] = "服务曾重启，未完成调用没有自动重发"
-    return Run({}, data).snapshot(full, reviews=reviews)
+    import iq_review
+    import iq_scoring
+    if reviews and review_snapshot is None:
+        review_snapshot = iq_review.snapshot_index().get(run_id, {})
+    # 只缓存摘要，完整题干和原回答按需读取，避免缓存随长回答无限增长。
+    # 同时绑定评分版本和复核内容；原地重试或复核结论变化都会立即失效。
+    with _SUMMARY_LOCK:
+        stat = os.stat(path)
+        stamp = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+        key = (path, stamp, reviews, iq_scoring.VERSION, iq_review.VERSION,
+               (review_snapshot or {}).get("revision"))
+        if not full and key in _SUMMARY_CACHE:
+            _SUMMARY_CACHE.move_to_end(key)
+            return copy.deepcopy(_SUMMARY_CACHE[key])
+        def build():
+            """Rebuild a view from original answers, retaining restart interruption semantics."""
+            with open(path, encoding="utf-8") as stream:
+                data = json.load(stream)
+            if data["status"] in ("running", "stopping"):
+                data["status"] = "interrupted"
+                data["error"] = "服务曾重启，未完成调用没有自动重发"
+            return Run({}, data).snapshot(full, reviews=reviews, review_snapshot=review_snapshot)
+
+        if full:
+            result = build()
+        else:
+            if _SUMMARY_CODE is None:
+                import iq_benchmarks
+                _SUMMARY_CODE = code_revision(__file__, iq_scoring.__file__, iq_review.__file__,
+                                              iq_tasks.__file__, iq_benchmarks.__file__)
+            # Reuse only derived summaries after restart. Raw answers remain in their
+            # original files; any answer, review or scoring-code change rebuilds the view.
+            result = _DISK_SUMMARIES.get((path, reviews), (key, _SUMMARY_CODE), build,
+                                         os.path.join(ROOT, ".summary-cache"))
+        latest = os.stat(path)
+        if not full and stamp == (latest.st_mtime_ns, latest.st_ctime_ns, latest.st_size, latest.st_ino):
+            # 并发的榜单和历史读取共用一次计算；读到原子替换前的文件时不缓存到新版本。
+            _SUMMARY_CACHE[key] = result
+            if len(_SUMMARY_CACHE) > 256:
+                _SUMMARY_CACHE.popitem(last=False)
+            return copy.deepcopy(result)
+        return result
 
 
 def history(limit: int | None = 50) -> list[dict[str, Any]]:
@@ -737,10 +785,12 @@ def history(limit: int | None = 50) -> list[dict[str, Any]]:
         ids.update(name[:-5] for name in os.listdir(ROOT) if name.endswith(".json") and _VALID_ID.fullmatch(name[:-5]))
     with _LOCK:
         ids.update(_RUNS)
+    import iq_review
+    review_index = iq_review.snapshot_index()
     rows = []
     for run_id in ids:
         try:
-            data = get(run_id)
+            data = get(run_id, review_snapshot=review_index.get(run_id, {}))
             if data:
                 rows.append(data)
         except (ValueError, OSError, KeyError):

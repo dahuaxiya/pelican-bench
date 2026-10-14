@@ -23,6 +23,7 @@ from typing import Any
 import config
 import llm
 import svg_sanitize
+from query_cache import QueryCache, fingerprint
 
 class Run:
     """一次跑批的状态容器。
@@ -374,8 +375,11 @@ def load_run_file(run_id: str) -> dict[str, Any] | None:
     if not os.path.exists(path):
         return None
     try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
+        def read():
+            """Load one immutable source revision; callers receive independent copies."""
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        return _FILE_CACHE.get(path, fingerprint(path), read)
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -389,7 +393,7 @@ def list_runs() -> list[dict[str, Any]]:
     if not os.path.isdir(config.RUNS_DIR):
         return out
     for name in sorted(os.listdir(config.RUNS_DIR), reverse=True):
-        data = load_run_file(name)
+        data = _disk_metadata(name)
         if not data:
             continue
         out.append({
@@ -412,14 +416,34 @@ def list_runs() -> list[dict[str, Any]]:
 # 因为还在跑的批次根本没有 finished_at。
 # ---------------------------------------------------------------------------
 
-# 历史跑批的卡片缓存：run_id -> 该批次的精简结果列表。
-#
-# 必须缓存：首页是秒级轮询，而每个 runs/<id>/results.json 里塞着整批 SVG 源码，
-# 跑过几十批之后，不缓存等于每次轮询都重新解析几十 MB JSON。
-# 缓存不会脏：results.json 只在批次结束时写一次；而且本进程跑的批次一直留在 _RUNS 里，
-# 永远走内存分支，不会命中这个缓存。只缓存解析成功的结果，避免把"暂时读不到"固化下来。
-_GALLERY_CACHE: dict[str, list[dict[str, Any]]] = {}
-_GALLERY_CACHE_LOCK = threading.Lock()
+# Metadata and full SVG data use separate bounded caches. File identity invalidates
+# both after replacement or restore; running batches always use live in-memory state.
+_FILE_CACHE = QueryCache(entries=16, byte_limit=64 * 1024 * 1024)
+_METADATA_CACHE = QueryCache(entries=256)
+
+
+def _disk_metadata(run_id):
+    """Cache only list/card fields by file revision, never a second full SVG history.
+
+    Args:
+        run_id: Generated run identifier; invalid paths are rejected before stat/read.
+    Returns:
+        Run summary and gallery cells, or None for missing/corrupt records.
+    """
+    if not run_id or not all(ch.isalnum() or ch == "-" for ch in run_id):
+        return None
+    path = os.path.join(config.RUNS_DIR, run_id, "results.json")
+    def build():
+        """Extract both consumers' small fields in one parse of the original file."""
+        data = load_run_file(run_id)
+        if not data:
+            return None
+        return {**{k: data.get(k) for k in ("total", "done", "finished_at")},
+                "cells": [_gallery_cell(r, run_id, data.get("finished_at")) for r in data.get("results", [])]}
+    try:
+        return _METADATA_CACHE.get(path, fingerprint(path), build)
+    except (OSError, ValueError):
+        return None
 
 
 def _gallery_cell(result: dict[str, Any], run_id: str, finished_at: float | None) -> dict[str, Any]:
@@ -459,22 +483,7 @@ def _disk_cells(run_id: str) -> list[dict[str, Any]]:
     @param run_id 跑批 id
     @return 精简后的卡片列表；批次不存在或文件损坏时为空列表
     """
-    with _GALLERY_CACHE_LOCK:
-        hit = _GALLERY_CACHE.get(run_id)
-    if hit is not None:
-        return hit
-    data = load_run_file(run_id)
-    if not data:
-        # 不缓存失败结果：runs/ 下可能混着 .DS_Store 之类的杂项，
-        # load_run_file 对它们是纯字符串判断，重试代价可以忽略。
-        return []
-    cells = [
-        _gallery_cell(r, run_id, data.get("finished_at"))
-        for r in data.get("results") or []
-    ]
-    with _GALLERY_CACHE_LOCK:
-        _GALLERY_CACHE[run_id] = cells
-    return cells
+    return (_disk_metadata(run_id) or {}).get("cells", [])
 
 
 def _all_run_ids() -> list[str]:

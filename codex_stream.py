@@ -36,7 +36,7 @@ def _command(binary):
     return command
 
 
-def complete(model, prompt, timeout, cancel_event=None, on_diagnostic=None, on_output=None):
+def complete(model, prompt, timeout, cancel_event=None, on_diagnostic=None, on_output=None, proxy_url=None):
     """测量一次独立流式请求；只认正文 delta，不用完整消息补造首字时间。
 
     Args:
@@ -46,10 +46,13 @@ def complete(model, prompt, timeout, cancel_event=None, on_diagnostic=None, on_o
         cancel_event: 在初始化和生成期间都可生效的取消信号。
         on_diagnostic: 非阻塞回调，只接收脱敏错误类别和相对时间。
         on_output: 非阻塞回调，只接收首个正文增量的相对时间，不含正文。
+        proxy_url: 节点测试专用的本机代理；仅设置本次子进程，禁止回退其他路由。
     Returns:
         完整回答、真实用量和观测时间；没有 delta 时 ttft 保持 None。
     """
     home = codex_auth.selected_home()
+    if proxy_url is not None and home is None:
+        raise llm.LLMError("节点模型实测需要在本站登录 ChatGPT")
     if home is None:
         # app-server 没有 exec 的 ignore-user-config。桌面账号继续用已隔离的旧路径，
         # 避免为了计时加载用户全局 MCP、hooks 或规则；网站登录后才启用此适配器。
@@ -65,9 +68,18 @@ def complete(model, prompt, timeout, cancel_event=None, on_diagnostic=None, on_o
     if cancel_event and cancel_event.is_set():
         raise llm.LLMCancelled("已取消 Codex 请求")
     started = time.monotonic()
+    environment = channel._environment(home=home)
+    if proxy_url is not None:
+        from network_transport import local_address
+        local_address(proxy_url)
+        # Override both cases and remove bypasses in this subprocess only. Otherwise
+        # a GUI/system proxy or NO_PROXY can silently invalidate node comparisons.
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            environment[key] = proxy_url
+        environment["NO_PROXY"] = environment["no_proxy"] = ""
     with tempfile.TemporaryDirectory(prefix="pelican-stream-") as directory, tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(_command(binary), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=errors, cwd=directory, env=channel._environment(home=home),
+                                   stderr=errors, cwd=directory, env=environment,
                                    start_new_session=True)
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)

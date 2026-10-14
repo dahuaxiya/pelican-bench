@@ -13,11 +13,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
 import mimetypes
 import os
 import secrets
 import threading
+import time
+from collections import OrderedDict
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -34,6 +38,7 @@ import report
 import codex_auth
 import kimi_channel
 import codex_probe
+import network_probe
 
 STATIC_DIR = os.path.join(config.SOURCE_ROOT, "static")
 
@@ -41,11 +46,40 @@ STATIC_DIR = os.path.join(config.SOURCE_ROOT, "static")
 _ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
 # 登录切换和任务创建共用锁，防止检查空闲之后另一请求恰好启动新任务。
 _ACCOUNT_ACTION_LOCK = threading.RLock()
+_MODEL_RESULTS = OrderedDict()
+_MODEL_LOCK = threading.Lock()
+_MODEL_FETCH_LOCKS = [threading.Lock() for _ in range(32)]
+
+
+def _model_catalog(site, refresh=False):
+    """Reuse a successful ordinary-site catalog for 30 seconds, with explicit refresh.
+
+    Args:
+        site: Server-loaded site configuration; URL/key changes invalidate prior entries.
+        refresh: Bypass the short cache when the user explicitly asks to refresh models.
+    Returns:
+        Independent public catalog. Failures remain visible and are never cached.
+    """
+    key = hashlib.sha256(json.dumps([site["base_url"], site.get("api_key", "")]).encode()).hexdigest()
+    # A bounded set of striped locks coalesces identical lookups; colliding catalog
+    # keys may wait, but other API routes never do. No credential is retained as a key.
+    with _MODEL_FETCH_LOCKS[int(key[:8], 16) % len(_MODEL_FETCH_LOCKS)]:
+        with _MODEL_LOCK:
+            cached = _MODEL_RESULTS.get(key)
+            if not refresh and cached and time.monotonic() - cached[0] < 30:
+                _MODEL_RESULTS.move_to_end(key)
+                return copy.deepcopy(cached[1])
+        result = {"models": llm.list_models(site["base_url"], site.get("api_key", ""), timeout=30)}
+        with _MODEL_LOCK:
+            _MODEL_RESULTS[key] = (time.monotonic(), result)
+            if len(_MODEL_RESULTS) > 64:
+                _MODEL_RESULTS.popitem(last=False)
+        return copy.deepcopy(result)
 
 
 def _evaluation_busy():
     """只看内存中仍活动的任务及复核队列，避免磁盘历史被当成在途工作。"""
-    if codex_probe.manager.busy():
+    if codex_probe.manager.busy() or network_probe.manager.busy():
         return True
     with iq._LOCK:
         if any(run.data.get("status") in ("running", "stopping") for run in iq._RUNS.values()):
@@ -165,6 +199,17 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/runtime/status":
                 self._json({"state": "stopping" if getattr(self.server, "stopping", False) else "running",
                             "busy": _evaluation_busy()})
+            elif path == "/api/network/config":
+                self._json(network_probe.manager.settings())
+            elif path == "/api/network/models":
+                self._json(network_probe.network_model.catalog())
+            elif path == "/api/network":
+                self._json(network_probe.manager.snapshot())
+            elif path == "/api/network/history":
+                self._json(network_probe.manager.history(int(query.get("page", ["1"])[0])))
+            elif path.startswith("/api/network/run/"):
+                data = network_probe.manager.get(path.rsplit("/", 1)[1])
+                self._json(data or {"error": "批次不存在"}, 200 if data else 404)
             elif path == "/api/models":
                 self._api_models(query)
             elif path == "/api/chatgpt/status":
@@ -186,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"suites": [iq_tasks.manifest(name) for name in
                                       ("bbeh-smoke", "bbeh-mini", "arc-smoke", "arc-agi-2", "quick", "full")]})
             elif path == "/api/swe/environment":
-                self._json(swe.environment())
+                self._json(swe.environment(refresh=query.get("refresh") == ["1"]))
             elif path == "/api/swe/runs":
                 self._json({"runs": swe.history()})
             elif path == "/api/swe/leaderboard":
@@ -230,12 +275,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
 
     def do_POST(self) -> None:  # noqa: N802
-        """串行处理任务创建及账号切换，保证账号切换的空闲检查与实际动作不交错。"""
+        """创建与账号切换保持互斥；取消已有任务不等待无关的控制器或登录网络请求。"""
+        if urlparse(self.path).path in {"/api/probe/cancel", "/api/chatgpt/probe/cancel",
+                                       "/api/iq/cancel", "/api/swe/cancel", "/api/network/cancel"}:
+            # Cancel operations only signal existing workers, never create work or change
+            # accounts. Each manager retains its own state lock and all origin checks.
+            self._dispatch_post()
+            return
         with _ACCOUNT_ACTION_LOCK:
             self._dispatch_post()
 
     def _dispatch_post(self) -> None:
-        """在共享操作锁内核对实例、同源和停机状态，避免检查空闲后又创建任务。"""
+        """核对实例、同源和停机状态；创建任务的调用方持有共享操作锁。"""
         if not self._host_ok():
             self._json({"error": "只允许通过 127.0.0.1 访问"}, 403)
             return
@@ -248,7 +299,7 @@ class Handler(BaseHTTPRequestHandler):
             if getattr(self.server, "stopping", False):
                 self._json({"error": "服务正在停止，不再接受操作"}, 503)
                 return
-            if path in ("/api/run", "/api/config", "/api/probe", "/api/probe/cancel", "/api/cli/site", "/api/runtime/stop") or path.startswith(("/api/chatgpt/", "/api/kimi/")):
+            if path in ("/api/run", "/api/config", "/api/probe", "/api/probe/cancel", "/api/cli/site", "/api/runtime/stop") or path.startswith(("/api/chatgpt/", "/api/kimi/", "/api/network/")):
                 # SVG 与设置同样可触发账号用量或改变路由，不能允许第三方网页借本机登录态代发。
                 origin = self.headers.get("Origin")
                 if origin and origin != "http://" + self.headers.get("Host", ""):
@@ -257,6 +308,16 @@ class Handler(BaseHTTPRequestHandler):
                 if self.headers.get_content_type() != "application/json":
                     self._json({"error": "需要 application/json 请求"}, 415)
                     return
+            # A node benchmark temporarily changes shared networking. This check is
+            # inside the creation lock, so no new evaluation can slip past it.
+            network_conflicts = {"/api/run", "/api/probe", "/api/chatgpt/probe", "/api/iq/run",
+                                 "/api/iq/retry", "/api/iq/review", "/api/iq/review-run", "/api/swe/run"}
+            if path in network_conflicts and network_probe.manager.busy():
+                self._json({"error": "节点测速或切换正在进行，请等待结束后再开始评测"}, 409)
+                return
+            if path.startswith("/api/network/"):
+                self._api_network(path)
+                return
             if path == "/api/runtime/stop":
                 token = getattr(self.server, "control_token", None)
                 supplied = self.headers.get("X-Pelican-Control", "")
@@ -346,6 +407,30 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
 
     # ---------- 具体处理 ----------
+
+    def _api_network(self, path):
+        """Serialize local tests and explicit verified switches with evaluation creation."""
+        data = self._read_json()
+        if path in ("/api/network/run", "/api/network/recover", "/api/network/apply"):
+            if _evaluation_busy() or codex_auth.manager.pending or kimi_channel.manager.pending:
+                self._json({"error": "请先结束当前评测、复核或账号登录，再切换节点测速"}, 409)
+                return
+        manager = network_probe.manager
+        if path == "/api/network/config":
+            result = manager.configure(data)
+        elif path == "/api/network/run":
+            result = manager.start(data)
+        elif path == "/api/network/apply" and set(data) <= {"run_id"}:
+            result = manager.apply_best(data.get("run_id"))
+        elif path == "/api/network/cancel" and set(data) == {"run_id"}:
+            result = manager.cancel(data["run_id"])
+        elif path == "/api/network/discover" and not data:
+            result = manager.discover()
+        elif path == "/api/network/recover" and not data:
+            result = manager.recover()
+        else:
+            raise ValueError("节点测速操作或参数不受支持")
+        self._json(result)
 
     def _api_cli_site(self):
         """仅更新指定普通站点，锁内读取最新配置，保留其他站点、提示词和复核设置。"""
@@ -444,25 +529,25 @@ class Handler(BaseHTTPRequestHandler):
         站点用名字指定，base_url 和 key 都从服务端配置取，不接受前端直接传地址，
         这样前端无法借这个接口把请求打到任意地址。
 
-        @param query URL 查询参数，需含 site
+        @param query URL 查询参数，需含 site；refresh=1 显式绕过目录缓存
         """
         name = (query.get("site") or [""])[0]
         import official_channels
         for channel in official_channels.adapters():
             if name == channel.SITE:
-                self._json(channel.catalog(refresh=True))
+                self._json(channel.catalog(refresh=query.get("refresh") == ["1"]))
                 return
-        cfg = config.load()
+        cfg = config.load(include_official=False)
         site = next((s for s in cfg["sites"] if s["name"] == name), None)
         if not site:
             self._json({"error": f"找不到站点：{name}"}, 404)
             return
         try:
-            models = llm.list_models(site["base_url"], site.get("api_key", ""), timeout=30)
+            result = _model_catalog(site, refresh=query.get("refresh") == ["1"])
         except llm.LLMError as exc:
             self._json({"error": str(exc), "models": site.get("models") or []}, 200)
             return
-        self._json({"models": models})
+        self._json(result)
 
     def _api_model_history(self, query: dict[str, list[str]]) -> None:
         """读取一个模型组合的历史，不接受客户端指定文件路径。
@@ -629,6 +714,7 @@ def main(argv=None, on_listening=None, instance_id=None, control_token=None) -> 
     server.control_token = control_token
     server.stopping = False
     codex_probe.manager.restore_history()
+    network_probe.manager.restore_history()
     server.engineering_port = args.engineering_port
     url = f"http://127.0.0.1:{server.server_port}/"
     if on_listening:
@@ -641,6 +727,7 @@ def main(argv=None, on_listening=None, instance_id=None, control_token=None) -> 
     except KeyboardInterrupt:
         print("\n停了")
     finally:
+        network_probe.manager.close()
         codex_probe.manager.cancel()
         server.server_close()
         codex_auth.manager.close()

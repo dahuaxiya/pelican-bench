@@ -136,7 +136,30 @@ def emit(value, as_json=False):
     for key in common:
         if key in value:
             print(f"{key}: {value[key]}")
-    if "rows" in value:
+    if value.get("kind") == "network":
+        model_mode = value.get("options", {}).get("mode") == "model"
+        print("节点\t成功/尝试\t首字中位耗时\t端到端吞吐\t总耗时中位数" if model_mode else "节点\t成功/尝试\t握手中位延迟\t最慢成功\t波动（极差）")
+        for row in value.get("rows", []):
+            if model_mode:
+                print(f'{row["name"]}\t{row["success"]}/{row["attempts"]}\t'
+                      f'{_metric(row.get("median_ttft_ms"), "ms")}\t{_metric(row.get("median_tokens_per_second"), "token/s")}\t'
+                      f'{_metric(row.get("median_ms"), "ms")}')
+                continue
+            print(f'{row["name"]}\t{row["success"]}/{row["attempts"]}\t'
+                  f'{_metric(row["median_ms"], "ms")}\t{_metric(row["max_success_ms"], "ms")}\t'
+                  f'{_metric(row["spread_ms"], "ms")}')
+        print("节点恢复: " + json.dumps(value.get("restoration"), ensure_ascii=False))
+        if value.get("failure"):
+            print(value["failure"])
+        if value.get("recommendations"):
+            print("建议主用 / 备用: " + " / ".join(value["recommendations"]))
+        if value.get("application"):
+            application = value["application"]
+            print("节点切换: " + application["status"] + " / " + application["target"])
+            print("切换后核对: " + json.dumps(application.get("restoration"), ensure_ascii=False))
+            if application.get("failure"):
+                print(application["failure"])
+    elif "rows" in value:
         print("站点 / 模型\t状态\t端到端 token/s\t首字延迟 (TTFT)\t容量信号")
         for row in value["rows"]:
             metrics = row.get("metrics") or {}
@@ -183,7 +206,7 @@ def parser():
         cmd = commands.add_parser(name, help=help_text)
         cmd.add_argument("--json", action="store_true")
     cmd = commands.add_parser("open", help="打开本机网页，未运行时后台启动")
-    cmd.add_argument("page", nargs="?", default="performance", choices=("performance", "iq", "home", "settings", "engineering"))
+    cmd.add_argument("page", nargs="?", default="performance", choices=("performance", "iq", "home", "settings", "engineering", "network"))
     cmd = commands.add_parser("logs", help="读取后台服务日志")
     cmd.add_argument("--lines", type=int, default=50)
     cmd.add_argument("--follow", "-f", action="store_true")
@@ -247,6 +270,38 @@ def parser():
         if name == "retry":
             cmd.add_argument("--no-wait", action="store_true")
             cmd.add_argument("--wait-timeout", type=int, default=0)
+    vpn = commands.add_parser("vpn", help="VPN 节点握手测速或官方模型首字与吞吐实测")
+    actions = vpn.add_subparsers(dest="action", required=True)
+    for action in ("config", "discover", "test", "results", "cancel", "recover", "apply"):
+        cmd = actions.add_parser(action)
+        cmd.add_argument("--json", action="store_true")
+        if action == "config":
+            cmd.add_argument("--controller")
+            cmd.add_argument("--proxy")
+            cmd.add_argument("--group")
+            cmd.add_argument("--secret-env", help="从环境变量读取控制密钥，不放入命令行")
+        elif action == "test":
+            cmd.add_argument("--mode", choices=("handshake", "model"), default="handshake")
+            cmd.add_argument("--model", help="模型实测使用的官方模型；需要在本站登录 ChatGPT")
+            cmd.add_argument("--sort-by", choices=("ttft", "throughput"), default="ttft")
+            cmd.add_argument("--repeats", type=int, default=5)
+            cmd.add_argument("--top", type=int, default=6, help="HTTPS 初筛候选数；额外包含原节点")
+            cmd.add_argument("--concurrency", type=int, default=6, help="节点并发数，默认6，范围1..50；1为串行")
+            cmd.add_argument("--timeout", type=int, help="单次总时限；握手默认12秒，模型实测默认180秒")
+            cmd.add_argument("--node", action="append", dest="nodes", help="只测指定叶子节点，可重复")
+            cmd.add_argument("--no-wait", action="store_true")
+            cmd.add_argument("--wait-timeout", type=int, default=0)
+        elif action == "results":
+            cmd.add_argument("run_id", nargs="?")
+            cmd.add_argument("--watch", action="store_true")
+            cmd.add_argument("--page", type=int, default=1)
+            cmd.add_argument("--wait-timeout", type=int, default=0)
+        elif action == "cancel":
+            cmd.add_argument("run_id")
+        elif action == "apply":
+            cmd.add_argument("run_id", nargs="?", help="采用此批次排名；省略则使用当前配置最新完成的批次")
+            cmd.add_argument("--no-wait", action="store_true")
+            cmd.add_argument("--wait-timeout", type=int, default=0)
     return root
 
 
@@ -273,7 +328,7 @@ def select_targets(args, client):
 
 def result_path(kind, run_id, full=False):
     """构造结果路径，用户提供的 ID 只能作为一个转义后的路径段。"""
-    prefix = ("/api/probe/history/" if kind in ("performance", "capacity") else
+    prefix = ("/api/network/run/" if kind == "network" else "/api/probe/history/" if kind in ("performance", "capacity") else
               "/api/run/" if kind == "svg" else f'/api/{"swe" if kind == "engineering" else "iq"}/run/')
     return prefix + urllib.parse.quote(run_id, safe="") + ("?full=1" if full else "")
 
@@ -299,7 +354,9 @@ def read_result(client, kind, run_id, full=False):
 
 
 def pending(kind, data):
-    """IQ 的回答完成不代表最终分可用；仍要等同一批次的自动复核结束。"""
+    """等待复核或节点切换验证结束，不能只凭原批次已完成提前返回。"""
+    if kind == "network" and data.get("application", {}).get("status") in ("running", "stopping"):
+        return True
     if kind == "svg":
         return bool(data.get("running"))
     if data.get("status") in ("running", "stopping", "queued"):
@@ -315,6 +372,8 @@ def pending(kind, data):
 
 def result_exit(kind, data):
     """0 表示完整执行，3 表示接口/环境/复核失败；题目答错本身不是 CLI 故障。"""
+    if kind == "network":
+        return 0 if data.get("status") == "completed" and data.get("recommendations") else 3
     if kind in ("performance", "capacity"):
         return 0 if data.get("status") == "completed" and all(r.get("status") == "success" for r in data.get("rows", [])) else 3
     if kind == "svg":
@@ -346,13 +405,25 @@ def wait_result(client, kind, run_id, timeout=0, full=False):
             review = data.get("auto_review") or {}
             rows = data.get("rows", [])
             done = data.get("done", sum(r.get("status") not in ("queued", "running") for r in rows))
-            text = f'{run_id}  {data.get("status", "running" if data.get("running") else "completed")}  {done}/{data.get("total", len(rows))}'
+            total = data.get("total", len(rows))
+            if kind == "network" and data.get("phase") == "https":
+                done, total = data.get("screened", 0), data.get("screen_total", 0)
+            text = f'{run_id}  {data.get("status", "running" if data.get("running") else "completed")}  {done}/{total}'
             if review:
                 text += f'  复核 {review.get("status")} {review.get("done", 0)}/{review.get("total", 0)}'
             if data.get("auto_retry", {}).get("round"):
                 text += f'  自动重试第 {data["auto_retry"]["round"]} 轮'
             if data.get("phase"):
                 text += "  " + data["phase"]
+            if kind == "network" and data.get("options", {}).get("concurrency"):
+                text += f'  并发 {data["options"]["concurrency"]}  运行 {data.get("running", 0)}  排队 {data.get("queued", 0)}'
+            if kind == "network" and data.get("current_node"):
+                text += f'  {data["current_node"]} 第 {data.get("round", 1)} 次'
+                if data.get("output_observation"):
+                    text += '  首字 ' + _metric(data["output_observation"]["elapsed_seconds"], "s")
+            if kind == "network" and data.get("application"):
+                application = data["application"]
+                text += f'  切换 {application["target"]} {application["status"]} {application["phase"]}'
             if text != last:
                 print(text, file=sys.stderr, flush=True)
                 last = text
@@ -380,6 +451,52 @@ def wait_result(client, kind, run_id, timeout=0, full=False):
         raise
 
 
+def execute_vpn(args, client):
+    """Run node operations through the one local service, sharing website history."""
+    action, code = args.action, 0
+    if action == "config":
+        values = {key: getattr(args, key) for key in ("controller", "proxy", "group") if getattr(args, key) is not None}
+        if args.secret_env:
+            if args.secret_env not in os.environ:
+                raise ValueError("控制密钥环境变量不存在")
+            values["secret"] = os.environ[args.secret_env]
+        data = client.request("/api/network/config", values) if values else client.request("/api/network/config")
+    elif action in ("discover", "recover"):
+        data = client.request("/api/network/" + action, {})
+    elif action == "cancel":
+        data = client.request("/api/network/cancel", {"run_id": args.run_id})
+    elif action == "apply":
+        print("正在切换最优节点并验证官方连接；验证失败会恢复切换前的节点。", file=sys.stderr)
+        data = client.request("/api/network/apply", {"run_id": args.run_id} if args.run_id else {})
+        if not args.no_wait:
+            application_id = data["application"]["id"]
+            data, code = wait_result(client, "network", data["id"], args.wait_timeout)
+            # Another caller may apply the same ranking later; don't report its
+            # success as the outcome of this CLI invocation.
+            if not code:
+                code = 0 if data.get("application", {}).get("id") == application_id and data["application"]["status"] == "succeeded" else 3
+    elif action == "results":
+        if args.watch and not args.run_id:
+            raise ValueError("--watch 需要批次 ID")
+        if args.watch:
+            data, code = wait_result(client, "network", args.run_id, args.wait_timeout)
+        else:
+            data = read_result(client, "network", args.run_id) if args.run_id else client.request("/api/network/history?page=" + str(args.page))
+    else:
+        body = {key: getattr(args, key) for key in ("repeats", "top", "timeout", "nodes", "mode", "model", "sort_by", "concurrency") if getattr(args, key) is not None}
+        if args.mode == "model" and not args.model:
+            raise ValueError("模型实测需要 --model，使用本站登录的 ChatGPT 额度")
+        if args.mode == "model":
+            print("模型实测将使用 ChatGPT 额度；固定长输出题干、medium 推理，各节点并发测试。", file=sys.stderr)
+        print("测试期间临时切换节点，影响新连接；结束或取消后恢复原选择。", file=sys.stderr)
+        data = client.request("/api/network/run", body)
+        print("批次: " + data["id"], file=sys.stderr)
+        if not args.no_wait:
+            data, code = wait_result(client, "network", data["id"], args.wait_timeout)
+    emit(data, args.json)
+    return code
+
+
 def execute(args, client):
     """通过已有 API 配置站点、提交和查询任务，不另起模型调用。
 
@@ -390,6 +507,8 @@ def execute(args, client):
         命令退出码，区分提交成功、完整测评和运行失败。
     """
     command = args.command
+    if command == "vpn":
+        return execute_vpn(args, client)
     if command == "sites":
         if args.action == "list":
             data = {"sites": client.request("/api/config")["sites"]}
@@ -407,7 +526,8 @@ def execute(args, client):
                         raise ValueError("密钥为空或超过 64 KiB")
             data = client.request("/api/cli/site", data)
     elif command == "models":
-        data = client.request("/api/models?" + urllib.parse.urlencode({"site": args.site}))
+        # Explicit model discovery must bypass the short cache used by automatic page loads.
+        data = client.request("/api/models?" + urllib.parse.urlencode({"site": args.site, "refresh": "1"}))
         if data.get("error"):
             emit(data, args.json)
             return 3

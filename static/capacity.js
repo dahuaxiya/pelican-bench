@@ -190,7 +190,7 @@
       const refresh = node('button', '刷新模型'); refresh.type = 'button'; refresh.dataset.icon = 'refresh-cw';
       refresh.disabled = busy || active() || catalogBusy || batchLoading;
       decorateButton(refresh, 'refresh-cw', true);
-      refresh.addEventListener('click', loadModels); actions.append(refresh);
+      refresh.addEventListener('click', () => loadModels(true)); actions.append(refresh);
     }
     if (active()) {
       const stop = node('button', state.status === 'stopping' ? '正在停止…' : '停止检测');
@@ -416,13 +416,14 @@
   }
 
   /** 刷新所选站点目录；切换站点后丢弃旧响应，禁止错用另一站点的模型。
+   * @param {boolean} refresh 是否由用户显式刷新，绕过服务端短时缓存。
    * @return {Promise<void>} 只读取目录，不自动发起推理请求。
    */
-  async function loadModels() {
+  async function loadModels(refresh = false) {
     const version = ++catalogVersion, name = siteSelected;
     catalogBusy = true; catalogError = ''; models = []; render();
     try {
-      const response = await fetch('/api/models?site=' + encodeURIComponent(name), { cache: 'no-store' });
+      const response = await fetch('/api/models?site=' + encodeURIComponent(name) + (refresh ? '&refresh=1' : ''), { cache: 'no-store' });
       const data = await response.json();
       if (version !== catalogVersion) { return; }
       if (!response.ok) { throw new Error(data.error || '模型目录加载失败'); }

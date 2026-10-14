@@ -66,12 +66,13 @@ DEFAULTS: dict[str, Any] = {
 _LOCK = threading.RLock()
 
 
-def load() -> dict[str, Any]:
+def load(*, include_official: bool = True) -> dict[str, Any]:
     """读取配置，缺失的键用默认值补齐。
 
     配置文件不存在时返回一份纯默认配置，而不是抛错，这样第一次启动可以直接进
     设置页填站点，不需要用户先手动拷一份 config.example.json。
 
+    @param include_official 普通站点目录查询可关闭账号渠道探测；其他调用保持默认
     @return 补齐默认值后的配置字典，调用方可以安全地直接索引已知键
     """
     raw: dict[str, Any] = {}
@@ -91,7 +92,8 @@ def load() -> dict[str, Any]:
     import official_channels
     cfg["sites"] = [_normalise_site(s) for s in cfg.get("sites") or [] if isinstance(s, dict)
                     and not official_channels.reserved(s)]
-    cfg["sites"].extend(channel.site_config() for channel in official_channels.adapters())
+    if include_official:
+        cfg["sites"].extend(channel.site_config() for channel in official_channels.adapters())
     cfg["pricing"] = _normalise_pricing(cfg.get("pricing"))
     return cfg
 

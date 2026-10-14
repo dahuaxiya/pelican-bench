@@ -23,9 +23,11 @@ function entry(model, before, after, seconds = 10) {
  * 初始化正式脚本，替换网络读取以验证排序与分页，不复制业务算法。
  * @param {object} t 测试上下文，负责关闭计时器和 DOM
  * @param {Array<object>} entries 合成榜单行
+ * @param {Function|null} historyResponse 可暂停或拒绝历史响应，验证榜单独立加载
+ * @param {Function|null} galleryResponse 可暂停画廊响应，验证可选模型目录不阻挡榜单
  * @return {Promise<object>} 页面查询、选择器和可变榜单快照
  */
-async function fixture(t, entries) {
+async function fixture(t, entries, historyResponse = null, galleryResponse = null) {
   const root = path.join(__dirname, '..');
   const dom = new JSDOM(fs.readFileSync(path.join(root, 'static/index.html'), 'utf8'), {
     runScripts: 'outside-only', url: 'http://127.0.0.1:8780/#iq'
@@ -39,9 +41,9 @@ async function fixture(t, entries) {
     calls.push({ url, method: options?.method || 'GET' });
     let data;
     if (url === '/api/config') { data = { sites: [] }; }
-    else if (url === '/api/gallery') { data = { cells: [] }; }
+    else if (url === '/api/gallery') { data = galleryResponse ? await galleryResponse() : { cells: [] }; }
     else if (url === '/api/iq/suites') { data = { suites: [suite] }; }
-    else if (url === '/api/iq/runs') { data = { runs: [] }; }
+    else if (url === '/api/iq/runs') { data = historyResponse ? await historyResponse() : { runs: [] }; }
     else if (url.startsWith('/api/iq/leaderboard')) { data = board; }
     else if (url.startsWith('/api/iq/reviews')) { data = { reviews: [] }; }
     else if (url.startsWith('/api/iq/run/')) {
@@ -62,6 +64,29 @@ async function fixture(t, entries) {
   assert.equal($('#iq-rank-error').hidden, true, $('#iq-rank-error').textContent);
   return { dom, $, all, choose, calls, board, tick };
 }
+
+test('ranking renders while history is pending or failed', async t => {
+  let rejectHistory;
+  const pending = new Promise((resolve, reject) => { rejectHistory = reject; });
+  const f = await fixture(t, [entry('A', 50, 70)], () => pending);
+  assert.equal(f.$('.iq-bar-identity strong').textContent, 'A');
+  assert.equal(f.$('#iq-rank-table').getAttribute('aria-busy'), 'false');
+  rejectHistory(new Error('history unavailable'));
+  await f.tick();
+  assert.equal(f.$('.iq-bar-identity strong').textContent, 'A');
+  assert.equal(f.$('#iq-rank-error').hidden, true);
+});
+
+test('optional gallery lookup never blocks ranking', async t => {
+  let rejectGallery;
+  const pending = new Promise((resolve, reject) => { rejectGallery = reject; });
+  const f = await fixture(t, [entry('A', 50, 70)], null, () => pending);
+  assert.equal(f.$('.iq-bar-identity strong').textContent, 'A');
+  rejectGallery(new Error('gallery unavailable'));
+  await f.tick();
+  assert.equal(f.$('#iq-rank-error').hidden, true);
+  assert.equal(f.$('.iq-bar-identity strong').textContent, 'A');
+});
 
 test('two scores and ranks stay visible while sort basis changes locally', async t => {
   const f = await fixture(t, [entry('A', 80, 81, 30), entry('B', 70, 90, 20), entry('C', 60, null, 10)]);

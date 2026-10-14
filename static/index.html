@@ -10,6 +10,7 @@
 <link rel="stylesheet" href="/static/model-actions.css">
 <link rel="stylesheet" href="/static/workspace.css">
 <link rel="stylesheet" href="/static/capacity.css">
+<link rel="stylesheet" href="/static/network.css">
 </head>
 <body>
 <a class="skip-link" href="#main">跳到内容</a>
@@ -21,6 +22,7 @@
     <a class="tab" data-view="iq" href="#iq"><i data-lucide="brain" aria-hidden="true"></i><span>IQ 评测</span></a>
     <a class="tab" href="/static/engineering.html"><i data-lucide="code-xml" aria-hidden="true"></i><span>工程评测</span></a>
     <a class="tab" data-view="performance" href="#performance"><i data-lucide="gauge" aria-hidden="true"></i><span>性能测评</span></a>
+    <a class="tab" data-view="network" href="#network"><i data-lucide="network" aria-hidden="true"></i><span>节点测速</span></a>
     <span class="nav-caption">工作区</span>
     <a class="tab" data-view="run" href="#run"><i data-lucide="play" aria-hidden="true"></i><span>SVG 跑批</span></a>
     <a class="tab" data-view="history" href="#history"><i data-lucide="history" aria-hidden="true"></i><span>运行历史</span></a>
@@ -192,6 +194,59 @@
     <div id="performance-probe"></div>
   </section>
 
+  <section id="view-network" class="view hidden" aria-labelledby="network-title">
+    <div class="page-heading"><div><h2 id="network-title">节点测速</h2><p class="page-description">VPN 节点到 GPT 官方的握手、首字耗时与吞吐</p></div></div>
+    <div class="network-layout">
+      <form id="network-form" class="network-setup">
+        <h3>测试范围</h3>
+        <fieldset class="network-modes" aria-label="节点测试模式">
+          <label><input type="radio" name="network-mode" id="network-mode-handshake" value="handshake" checked><span>握手测速</span></label>
+          <label><input type="radio" name="network-mode" id="network-mode-model" value="model"><span>模型实测</span></label>
+        </fieldset>
+        <div id="network-model-options" hidden>
+          <label>官方模型<select id="network-model"><option value="">请选择模型</option></select></label>
+          <label>排名依据<select id="network-sort"><option value="ttft">首字耗时优先</option><option value="throughput">吞吐优先</option></select></label>
+          <p class="network-muted">使用 ChatGPT 额度。相同提示词要求输出 600–800 词，推理强度 medium。</p>
+        </div>
+        <details open id="network-connection"><summary>Clash / Mihomo 连接</summary>
+          <label>代理管理接口<input id="network-controller" value="http://127.0.0.1:9090" type="url" required></label>
+          <label>HTTP / Mixed 代理<input id="network-proxy" value="http://127.0.0.1:7890" type="url" required></label>
+          <label>控制密钥<input id="network-secret" type="password" autocomplete="off" placeholder="未设置"></label>
+        </details>
+        <button id="network-discover" type="button" class="secondary-action" data-icon="refresh-cw">读取节点</button>
+        <label>选择组<select id="network-group" required><option value="">请先读取节点</option></select></label>
+        <p id="network-route" class="network-muted"></p>
+        <div class="network-options">
+          <label>初筛候选数<input id="network-top" type="number" min="1" max="50" value="6" required></label>
+          <label>每节点次数<input id="network-repeats" type="number" min="1" max="20" value="5" required></label>
+          <label>并发数<input id="network-concurrency" type="number" min="1" max="50" value="6" required></label>
+          <label>单次超时（秒）<input id="network-timeout" type="number" min="3" max="60" value="12" required></label>
+        </div>
+        <p class="network-notice">测试期间临时切换所选组，会影响新连接。结束或取消后恢复原节点；请勿同时用其他程序切换该组。</p>
+        <div class="network-actions"><button id="network-start" type="submit" data-icon="play">开始测速</button><button id="network-cancel" type="button" class="secondary-action" data-icon="square" hidden>停止</button></div>
+        <p id="network-message" role="status" class="network-muted"></p>
+        <p id="network-error" role="alert" hidden></p>
+      </form>
+      <section class="network-results" aria-label="节点测速结果">
+        <div class="network-result-heading"><h3 id="network-result-title">官方握手排名</h3><button id="network-live" type="button" class="secondary-action">当前测试</button></div>
+        <p id="network-progress" role="status" aria-live="polite">暂无测试</p>
+        <progress id="network-bar" max="1" value="0" aria-label="节点测速进度" hidden></progress>
+        <p id="network-recommendation"></p>
+        <div class="network-actions"><button id="network-apply" type="button" data-icon="arrow-right-left" disabled>切换最优节点</button></div>
+        <p id="network-application" role="status" aria-live="polite" class="network-muted"></p>
+        <p id="network-restore"></p>
+        <button id="network-recover" type="button" class="secondary-action" hidden>恢复原节点</button>
+        <div id="network-rank"></div>
+        <details id="network-screen"><summary>HTTPS 初筛</summary><div id="network-screen-results"></div></details>
+        <p id="network-metric-note" class="network-muted">握手测速只测认证建连，不发送模型问题；模型实测才会生成文本并统计首字耗时和吞吐。</p>
+      </section>
+    </div>
+    <section class="network-history" aria-label="节点测速历史">
+      <div class="network-result-heading"><h3>历史记录</h3><div class="network-actions"><button id="network-prev" type="button" class="secondary-action" data-icon="chevron-left" data-icon-only="true">上一页</button><span id="network-page"></span><button id="network-next" type="button" class="secondary-action" data-icon="chevron-right" data-icon-only="true">下一页</button></div></div>
+      <div id="network-history-list"></div>
+    </section>
+  </section>
+
   <section id="view-settings" class="view hidden">
     <div class="settings-heading">
       <div><h2>设置</h2>
@@ -262,6 +317,7 @@
 <script src="/static/model-actions.js"></script>
 <script src="/static/capacity.js"></script>
 <script src="/static/performance-history.js"></script>
+<script src="/static/network.js"></script>
 <script src="/static/chatgpt.js"></script>
 <script src="/static/app.js"></script>
 <script src="/static/iq.js"></script>

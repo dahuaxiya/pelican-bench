@@ -584,7 +584,7 @@
       const failures = {};
       await Promise.all(state.sites.map(async site => {
         try {
-          const result = await request('/api/models?site=' + encodeURIComponent(site.name));
+          const result = await request('/api/models?site=' + encodeURIComponent(site.name) + '&refresh=1');
           if (result.models && result.models.length) { state.models[site.name] = result.models; }
           if (result.error) { failures[site.name] = result.error; }
         } catch (e) { failures[site.name] = e.message; }
@@ -962,10 +962,11 @@
     });
   }
 
-  /** 同步选择中的批次；只维持一个轮询，隐藏页面时停止主动刷新。 */
+  /** 同步批次和榜单；榜单独立加载，历史或逐题详情失败不阻挡成绩展示。 */
   async function refresh() {
     const ticket = ++state.runRequest;
     clearTimeout(state.timer);
+    const ranking = loadRanking();
     try {
       await histories();
       if (ticket !== state.runRequest) { return; }
@@ -976,7 +977,6 @@
         render(run); await details();
       }
       else { node('iq-summary').replaceChildren(element('div', '暂无评测成绩', 'iq-empty')); }
-      await loadRanking();
     } catch (e) {
       error(e.message);
       if (!state.retrySubmitting && state.run?.retry && ['running', 'stopping'].includes(state.run.status)) {
@@ -985,7 +985,13 @@
         retryFeedback();
       }
     }
-    finally { if (state.visible && (state.busy || state.reviewBusy)) { state.timer = setTimeout(refresh, 1800); } }
+    finally {
+      // 等两条读取路径都结束再轮询，防止慢请求期间不断叠加下一轮扫描。
+      await ranking;
+      if (ticket === state.runRequest && state.visible && (state.busy || state.reviewBusy)) {
+        state.timer = setTimeout(refresh, 1800);
+      }
+    }
   }
 
   /**
@@ -1079,13 +1085,15 @@
     retryFeedback(); node('iq-retry').focus({ preventScroll: true });
   }
 
-  /** 初始化仅获取本机保存的元数据；不因进入页面自动发送付费请求。 */
+  /** 初始化本机元数据；榜单不等待画廊补全模型目录，也不发送付费请求。 */
   async function init() {
     if (state.ready) { await refresh(); return; }
     if (state.loading) { return; }
     state.loading = true;
     try {
-      const [saved, catalog, gallery] = await Promise.all([request('/api/config'), request('/api/iq/suites'), request('/api/gallery')]);
+      // 画廊只用于补全历史模型名称；它的扫描耗时或失败不能阻挡 IQ 成绩。
+      const galleryRequest = request('/api/gallery').catch(() => ({ cells: [] }));
+      const [saved, catalog] = await Promise.all([request('/api/config'), request('/api/iq/suites')]);
       state.sites = saved.sites; state.suites = catalog.suites;
       state.judgeSite = saved.iq_auto_review_site || ''; state.judgeModel = saved.iq_auto_review_model || '';
       // 刷新运行记录或返回本页时保留题集选择，避免把完整评测静默改成试跑。
@@ -1094,9 +1102,18 @@
       // 兼容只有旧题集的安装或测试环境。正常安装默认显示 BBEH 正式榜。
       if (!state.suites.some(s => s.benchmark)) { node('iq-rank-benchmark').value = 'foundation'; }
       state.sites.forEach(site => {
-        state.models[site.name] = Array.from(new Set((site.models || []).concat((gallery.cells || []).filter(c => c.site === site.name).map(c => c.model)))).sort();
+        state.models[site.name] = Array.from(new Set(site.models || [])).sort();
       });
-      state.ready = true; renderModels(); judgeOptions(); await refresh();
+      state.ready = true; renderModels(); judgeOptions();
+      const refreshing = refresh();
+      try {
+        const gallery = await galleryRequest;
+        state.sites.forEach(site => {
+          state.models[site.name] = Array.from(new Set(state.models[site.name].concat(
+            (gallery.cells || []).filter(c => c.site === site.name).map(c => c.model)))).sort();
+        });
+        renderModels(); judgeOptions();
+      } finally { await refreshing; }
     } catch (e) { error(e.message); }
     finally { state.loading = false; plan(); }
   }
@@ -1127,7 +1144,7 @@
     if (!site || state.judgeSaving || state.judgeLoading) { return; }
     state.judgeLoading = true; judgeSettingsState();
     try {
-      const data = await request('/api/models?site=' + encodeURIComponent(site));
+      const data = await request('/api/models?site=' + encodeURIComponent(site) + '&refresh=1');
       if (data.error) { throw new Error(data.error); }
       state.models[site] = data.models || []; judgeOptions(); node('iq-review-error').hidden = true;
     } catch (e) { node('iq-review-error').textContent = e.message; node('iq-review-error').hidden = false; }

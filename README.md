@@ -30,7 +30,7 @@ pelican-bench --data-dir ./my-bench-data
 也保留 npm 安装入口，需要 Node.js 20+ 和 Python 3.10+。npm 注册表尚未发布，请使用 GitHub Release 提供的安装包：
 
 ```sh
-npm install -g ./pelican-bench-0.4.0.tgz
+npm install -g https://github.com/dahuaxiya/pelican-bench/releases/download/v0.5.0/pelican-bench-0.5.0.tgz
 pelican-bench
 ```
 
@@ -109,6 +109,46 @@ pelican-bench test iq --help
 ~~~
 
 SVG 目前不支持单独取消，等待完成后再 stop。网页与 CLI 共用历史；--json 的标准输出只包含 JSON，进度写到 stderr。退出码：0 为命令成功；1 为连接或操作失败；2 为参数错误；3 为测评、取消或复核未完整成功；4 为等待超时；130 为用户中断等待。模型答错、工程题未修复属于测评结果，不会仅因此返回非零码。
+
+## VPN 节点测速
+
+网页入口是「节点测速」，CLI 使用同一个本机后端和历史记录。当前支持 Clash/Mihomo 兼容控制口及本机 HTTP/Mixed 代理，需要可读取的 ChatGPT 登录态。控制地址和代理端口以自己客户端的配置为准。
+
+```bash
+pelican-bench open network
+pelican-bench vpn config --controller http://127.0.0.1:9090 --proxy http://127.0.0.1:7890
+pelican-bench vpn discover
+pelican-bench vpn config --group '你的选择组'
+pelican-bench vpn test --top 6 --repeats 5
+pelican-bench vpn test --mode model --model gpt-6.1-sol --top 3 --repeats 3 --sort-by ttft
+pelican-bench vpn results
+pelican-bench vpn results <批次ID> --json
+pelican-bench vpn apply
+pelican-bench vpn apply <批次ID>
+pelican-bench vpn cancel <批次ID>
+pelican-bench vpn recover
+```
+
+控制口需要密钥时，用 `vpn config --secret-env CLASH_SECRET` 从环境变量读取；密钥只保存在本机私有配置，不出现在结果中。`vpn test --node '节点名'` 可重复传入，限定本次范围；`--no-wait` 提交后返回，使用 `vpn results <批次ID> --watch` 继续查看。
+
+测试先对所选组的具体节点做 HTTPS 初筛，再对最快的候选及范围内原节点轮流测相同次数。`--top` 控制候选数，最高 50；设为 50 可测本次初筛通过的全部节点（不超过 50 个，另含原节点）。嵌套自动组不直接参与排名，请选包含实际节点的手动组。每次官方请求都核对实际连接经过的节点与选择组。
+
+两种模式分别出排名：
+
+- **握手测速**（默认）：只测认证 WebSocket 建连，不发送模型问题。排名依次比较成功率、握手中位延迟、最慢成功耗时；波动是成功延迟的极差。单次默认 12 秒，最高 60 秒。
+- **模型实测**：需要先在本站设置中登录 ChatGPT，并选择账号提供的模型；使用订阅额度。各节点调用相同模型、相同提示词，要求生成 600–800 词，推理强度固定 medium，输出长度由模型决定。单次默认 180 秒，最高 600 秒。排名先看成功率，再按首字耗时中位数或端到端吞吐中位数排序；CLI 使用 `--sort-by ttft` 或 `--sort-by throughput`。
+
+两种模式默认并发 6，网页可调整，CLI 使用 `--concurrency 6`，范围 1–50。每轮各节点各测一次，下一轮等待本轮结束。建立连接时依次切换并核对实际路由，连接固定后并发收取响应；模型内部重连也重新核对。握手延迟不含本地调度等待，模型首字和端到端耗时包含节点建连等待。并发会共享本机带宽和账号额度；要比较节点独占性能，设为 `--concurrency 1`。
+
+首字耗时从本次官方客户端启动计到首个非空正文增量，包含启动、网络、排队和推理。端到端吞吐 = 上游实际输出 token 数（含推理）÷ 完整响应耗时，不代表首字之后的纯生成速度。缺少首字事件、缺少真实用量或回答过短时不参与速度排名，不用字符数估算 token。展开节点可看每次首字、吞吐、总耗时和用量；缓存、官方负载和客户端内部重连也会影响结果。
+
+未测满的节点保留明细但没有最终名次；全失败没有延迟分数；只有本轮全成功且指标完整的候选才作为主用或备用建议。每次结果独立保存，不混排握手与模型实测，也不混排不同时段的数据。
+
+测试会临时切换所选组，影响本机新建连接，因此与本服务的模型评测、复核及登录互斥。结束、取消、正常停机时恢复原节点并回读确认；强杀后在下次启动尝试恢复，失败可执行 `vpn recover`。检测到外部切换时停止并保留外部选择。Clash 没有原子比较交换接口，请勿同时运行其他节点切换程序。不会断开已有连接、修改订阅或规则，也不会自动长期切换到推荐节点。
+
+点击排名旁的「切换最优节点」，会采用当前展示批次中全部测试成功且指标完整的第一名。`vpn apply` 默认使用当前配置最新完成的批次，也可指定批次 ID。切换后重新核对节点并验证官方握手，不额外生成文本；成功才保留新选择，失败恢复点击前的节点。历史排名不代表当前速度，网络变化后应重新测速。切换影响新连接，已有长连接继续使用原连接。
+
+握手目标为 `chatgpt.com/backend-api/codex/responses`，成功要求 HTTP 101 和完整 WebSocket 升级校验；普通 HTTPS 成功不算。401、429、5xx 会停止握手测试整批，403 作为该节点的拒绝记录。模型实测遇到认证、额度、限流或容量错误会停止，避免把上游故障当成节点速度。少量样本不能证明长期稳定或所有模型都可用；模型实测结果也不能全部归因于 VPN。
 
 ## 数据与升级
 

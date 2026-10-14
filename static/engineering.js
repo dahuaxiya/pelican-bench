@@ -192,7 +192,7 @@
     try {
       for (const site of state.sites) {
         try {
-          const result = await api('/api/models?site=' + encodeURIComponent(site.name));
+          const result = await api('/api/models?site=' + encodeURIComponent(site.name) + '&refresh=1');
           if (result.error) { throw new Error(result.error); }
           state.models[site.name] = result.models;
         } catch (e) {

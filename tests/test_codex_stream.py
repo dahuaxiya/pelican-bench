@@ -17,8 +17,12 @@ import llm
 
 # 替身读取真实 stdin 并按 RPC 握手回包；不连接账号，不读取任何认证文件。
 SERVER = r'''
-import json, sys, time
+import json, os, sys, time
 scenario = sys.argv[1]
+if scenario == "proxy":
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        assert os.environ[key] == "http://127.0.0.1:12345"
+    assert os.environ["NO_PROXY"] == os.environ["no_proxy"] == ""
 def emit(event):
     print(json.dumps(event), flush=True)
 def note(method, **params):
@@ -78,7 +82,7 @@ for line in sys.stdin:
 class StreamTests(unittest.TestCase):
     """所有测试使用可回收的本地替身；错误路径也必须释放进程和管道。"""
 
-    def run_sample(self, scenario="normal", timeout=3, stop=None, seen=None):
+    def run_sample(self, scenario="normal", timeout=3, stop=None, seen=None, proxy=None):
         """启动协议替身并调用正式适配器，记录进程以便断言没有遗留子进程。
 
         Args:
@@ -86,6 +90,7 @@ class StreamTests(unittest.TestCase):
             timeout: 测试总时限，单位秒。
             stop: 可选取消事件。
             seen: 可选输出元数据容器。
+            proxy: 可选回环代理，用于核对仅本次子进程的路由配置。
         Returns:
             正式适配器结果；异常按正式行为传播。
         """
@@ -96,7 +101,7 @@ class StreamTests(unittest.TestCase):
                 patch.object(codex_stream.channel, "_kill", wraps=codex_stream.channel._kill) as cleanup:
             try:
                 return codex_stream.complete("gpt-test", "test", timeout, stop,
-                    on_output=seen.append if seen is not None else None)
+                    on_output=seen.append if seen is not None else None, proxy_url=proxy)
             finally:
                 self.assertEqual(cleanup.call_count, 1)
                 self.assertIsNotNone(cleanup.call_args.args[0].poll())
@@ -113,6 +118,18 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(result["text"], "Hello world")
         self.assertEqual(seen, [{"kind": "text_delta", "elapsed_seconds": result["ttft"]}])
         self.assertNotIn("Hello", json.dumps(seen))
+
+    def test_proxy_is_subprocess_only_and_requires_website_account(self):
+        """节点代理覆盖大小写和绕过配置，但不能改动后端的环境或回退桌面账号。"""
+        with patch.dict(os.environ, {"HTTPS_PROXY": "http://127.0.0.1:9000", "NO_PROXY": "*"}):
+            self.assertTrue(self.run_sample("proxy", proxy="http://127.0.0.1:12345")["completed"])
+            self.assertEqual(os.environ["HTTPS_PROXY"], "http://127.0.0.1:9000")
+            self.assertEqual(os.environ["NO_PROXY"], "*")
+        with patch.object(codex_stream.codex_auth, "selected_home", return_value=None), \
+                patch.object(codex_stream.channel, "complete") as legacy:
+            with self.assertRaises(llm.LLMError):
+                codex_stream.complete("gpt-test", "test", 1, proxy_url="http://127.0.0.1:12345")
+            legacy.assert_not_called()
 
     def test_completed_message_does_not_fill_missing_delta(self):
         """缺少 delta 时首字必须保持未知，不能用完整消息时间补造。"""

@@ -24,6 +24,7 @@ import config
 import iq
 import llm
 from runtime_paths import DISTRIBUTED
+from query_cache import QueryCache, fingerprint
 
 ROOT = Path(config.ROOT) / "swe-runs"
 DATA = Path(config.ROOT) / "swe-data"
@@ -40,6 +41,9 @@ SUITES = {"smoke": ("SWE-bench Lite · 3 题离线试跑", ["pallets__flask-4045
 _RUNS: dict[str, dict] = {}
 _LOCK = threading.RLock()
 ACTIVE_PORT = None
+_HISTORY_CACHE = QueryCache(entries=128)
+_ENV_LOCK = threading.Lock()
+_ENV_CHECK = None
 
 
 def digest(value: Any) -> str:
@@ -117,11 +121,27 @@ def tasks_for(suite: str, instance_ids: list[str] | None = None) -> tuple[dict, 
     return {**meta, "id": suite, "count": len(tasks), "instance_ids": [t["instance_id"] for t in tasks]}, tasks
 
 
-def environment() -> dict:
+def environment(refresh: bool = False) -> dict:
     """只检查依赖与专用 Docker，不因打开页面拉镜像或调用模型。
 
-    @return 是否可运行及具体缺失项
+    @param refresh 创建任务时必须为 True；页面轮询只复用十秒内的依赖探测
+    @return 是否可运行及具体缺失项，题集和磁盘空间始终实时读取
     """
+    global _ENV_CHECK
+    identity = (str(PYTHON), DOCKER, CONTEXT)
+    with _ENV_LOCK:
+        if refresh or _ENV_CHECK is None or _ENV_CHECK[0] != identity or time.monotonic() - _ENV_CHECK[1] >= 10:
+            _ENV_CHECK = (identity, time.monotonic(), _environment_issues())
+        issues = list(_ENV_CHECK[2])
+    if not (DATA / "tasks.json").is_file():
+        issues.append("SWE-bench Lite 题集未准备")
+    if shutil.disk_usage(config.ROOT).free < 10 * 1024**3:
+        issues.append("磁盘可用空间不足 10 GiB")
+    return {"ready": not issues, "issues": issues, "context": CONTEXT, **catalog()}
+
+
+def _environment_issues():
+    """Run bounded dependency checks; callers share the result only for display, not task admission."""
     issues = []
     if not PYTHON.is_file():
         issues.append("缺少工程评测 Python 环境")
@@ -140,11 +160,7 @@ def environment() -> dict:
             issues.append("专用 Docker 环境未启动")
     except (OSError, subprocess.TimeoutExpired):
         issues.append("专用 Docker 环境不可用")
-    if not (DATA / "tasks.json").is_file():
-        issues.append("SWE-bench Lite 题集未准备")
-    if shutil.disk_usage(config.ROOT).free < 10 * 1024**3:
-        issues.append("磁盘可用空间不足 10 GiB")
-    return {"ready": not issues, "issues": issues, "context": CONTEXT, **catalog()}
+    return issues
 
 
 def summarize(data: dict) -> list[dict]:
@@ -195,7 +211,18 @@ def get(run_id: str, full: bool = False) -> dict | None:
     target = run_path(run_id) / "run.json"
     with _LOCK:
         active = _RUNS.get(run_id)
-        data = copy.deepcopy(active["data"]) if active else json.loads(target.read_text()) if target.is_file() else None
+        data = copy.deepcopy(active["data"]) if active else None
+    if not active and target.is_file():
+        def read():
+            """Retain only fields needed by this view; full evidence still comes from the original."""
+            saved = json.loads(target.read_text())
+            if not full:
+                saved["results"] = [{k: v for k, v in row.items() if k not in
+                                     ("patch", "test_log", "trajectory", "response_diagnostics")}
+                                    for row in saved["results"]]
+            return saved
+        # Reading history must not hold the execution lock while parsing a large trajectory.
+        data = read() if full else _HISTORY_CACHE.get(str(target), fingerprint(target), read)
     if not data:
         return None
     if not active and data["status"] in ("running", "stopping"):
@@ -331,7 +358,7 @@ def start(cfg: dict, request: dict) -> dict:
             return previous
         if any(run["data"]["status"] in ("running", "stopping") for run in _RUNS.values()):
             raise ValueError("已有工程评测运行中")
-        ready = environment()
+        ready = environment(refresh=True)
         if not ready["ready"]:
             raise ValueError("；".join(ready["issues"]))
         data = {"run_id": run_id, "fingerprint": fingerprint, "suite": suite, "options": options,

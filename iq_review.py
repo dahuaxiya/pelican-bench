@@ -16,6 +16,7 @@ import iq
 import iq_scoring
 import iq_tasks
 import llm
+from query_cache import QueryCache, code_revision
 
 ROOT = Path(config.ROOT) / "iq-reviews"
 VERSION = "answer-verifier-agent-v2"
@@ -29,16 +30,65 @@ _AUTO_QUEUE: list[dict[str, Any]] = []
 _AUTO_THREAD: threading.Thread | None = None
 _AUTO_CONDITION = threading.Condition(_LOCK)
 _BATCHES: dict[str, dict[str, Any]] = {}
+_DISK_JOBS = QueryCache(entries=4)
+_DISK_CODE = None
+
+
+def _disk_jobs():
+    """Read unchanged review files once across queries and restarts; deleted files invalidate.
+
+    Returns:
+        Valid public job records. In-memory jobs are overlaid by snapshot_index.
+    """
+    global _DISK_CODE
+    signatures = []
+    if ROOT.is_dir():
+        with os.scandir(ROOT) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".json") or not iq._VALID_ID.fullmatch(entry.name[:-5]):
+                    continue
+                try:
+                    stat = entry.stat()
+                    signatures.append((entry.path, stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns, stat.st_ino))
+                except OSError:
+                    continue  # An externally removed record must not break neighboring runs.
+    signatures.sort()
+    if _DISK_CODE is None:
+        _DISK_CODE = code_revision(__file__)
+
+    def build():
+        """Skip corrupt neighbors, while binding each saved view to the complete file set."""
+        jobs = {}
+        for signature in signatures:
+            job_id = Path(signature[0]).stem
+            try:
+                job = _read_saved_job(*signature)
+                if (not isinstance(job, dict) or job.get("id") != job_id
+                        or not iq._VALID_ID.fullmatch(str(job.get("run_id", "")))
+                        or not isinstance(job.get("started_at"), (int, float)) or "status" not in job):
+                    continue
+                if job["status"] == "running":
+                    job = {**job, "status": "interrupted", "error": "服务已重启，复核请求未自动重发"}
+                jobs[job_id] = job
+            except (OSError, ValueError, KeyError):
+                continue
+        return jobs
+
+    # The index consumer overlays a separate dictionary and never mutates disk jobs.
+    # Copying thousands of immutable records here dominated otherwise cached queries.
+    return _DISK_JOBS.get(str(ROOT), (signatures, _DISK_CODE), build, ROOT / ".index-cache", copy_result=False)
 
 
 @lru_cache(maxsize=20000)
-def _read_saved_job(path: str, modified: int, size: int) -> dict[str, Any]:
+def _read_saved_job(path: str, modified: int, size: int, changed: int, inode: int) -> dict[str, Any]:
     """缓存未变化的复核文件，避免榜单轮询反复解析全部历史。
 
     Args:
         path: 由受限目录和合法 ID 构造的绝对路径。
         modified: 文件纳秒修改时间，原子替换后使缓存失效。
         size: 文件字节数，与修改时间共同区分文件版本。
+        changed: 纳秒状态变更时间，避免保留 mtime 的文件替换误用缓存。
+        inode: 文件身份，原子替换即使长度相同也视为新版本。
     Returns:
         缓存对象；调用方必须复制后使用，不能改写缓存状态。
     """
@@ -73,19 +123,22 @@ def source_hash(question: dict[str, Any], raw: str) -> str:
                                     sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def annotate(data: dict[str, Any]) -> None:
+def annotate(data: dict[str, Any], review_snapshot: dict[str, Any] | None = None) -> None:
     """合并复核证据到查询快照；原始和规范化分保留，未复核完不发布最终成绩。
 
     Args:
         data: 已含原始 summary 和 normalized 的独立快照；不会写回评测文件。
+        review_snapshot: 同一次历史查询共享的本批复核快照；省略时自行读取。
     """
+    if review_snapshot is None:
+        review_snapshot = snapshot_index().get(data["run_id"], {})
     questions = {q["id"]: q for q in data["questions"]}
     jobs = {}
-    for job in history(data["run_id"]):
+    for job in review_snapshot.get("jobs", []):
         if job.get("version") == VERSION and not job.get("advisory", True) and job.get("normalization_version") == iq_scoring.VERSION:
             jobs.setdefault((iq._cell(job), job.get("source_sha256")), job)
     data["review_version"] = VERSION
-    data["auto_review"] = automatic(data["run_id"])
+    data["auto_review"] = copy.deepcopy(review_snapshot.get("automatic"))
     for row in data["results"]:
         question = questions[row["question_id"]]
         final = {**row["normalized"], "source": "rules"}
@@ -215,14 +268,54 @@ def get(job_id: str) -> dict[str, Any] | None:
         if not path.exists():
             return None
         stat = path.stat()
-        job = copy.deepcopy(_read_saved_job(str(path), stat.st_mtime_ns, stat.st_size))
+        job = copy.deepcopy(_read_saved_job(str(path), stat.st_mtime_ns, stat.st_size,
+                                           stat.st_ctime_ns, stat.st_ino))
         if job["status"] == "running":
             job.update(status="interrupted", error="服务已重启，复核请求未自动重发")
         return job
 
 
+def snapshot_index() -> dict[str, dict[str, Any]]:
+    """一次扫描建立按评测批次分组的复核快照，供整页历史和榜单复用。
+
+    Returns:
+        每批的复核记录、自动复核摘要和内容指纹；内部共享记录只读，不能原地修改。
+    """
+    grouped: dict[str, dict[str, Any]] = {}
+    with _LOCK:
+        # 原子写入与内存状态更新均持有此锁；整次扫描使用同一份复核状态。
+        # 不为每批成绩重新读取全部作业，避免历史批次数乘复核条数的重复开销。
+        jobs = dict(_disk_jobs())
+        jobs.update(_JOBS)
+        for job in jobs.values():
+            group = grouped.setdefault(job["run_id"], {"jobs": [], "automatic": None})
+            # 活动作业仍可能被后台线程更新，离开锁之前先复制；磁盘缓存对象始终只读。
+            group["jobs"].append(copy.deepcopy(job) if job["id"] in _JOBS else job)
+        batches = list(_BATCHES.values())
+        for path in (ROOT / "batches").glob("*.json"):
+            if path.stem in _BATCHES or not iq._VALID_ID.fullmatch(path.stem):
+                continue
+            batch = _load_batch(path)
+            if (batch and batch.get("id") == path.stem
+                    and iq._VALID_ID.fullmatch(str(batch.get("run_id", "")))
+                    and isinstance(batch.get("started_at"), (int, float)) and "status" in batch):
+                if batch["status"] in ("queued", "running"):
+                    batch.update(status="interrupted", error="服务重启，自动复核未重新发送")
+                batches.append(batch)
+        for batch in batches:
+            group = grouped.setdefault(batch["run_id"], {"jobs": [], "automatic": None})
+            previous = group["automatic"]
+            if previous is None or (batch["started_at"], batch["id"]) > (previous["started_at"], previous["id"]):
+                group["automatic"] = copy.deepcopy({k: v for k, v in batch.items() if k != "job_ids"})
+    for group in grouped.values():
+        group["jobs"].sort(key=lambda job: job["started_at"], reverse=True)
+        # 答案文件不变时，复核完成、失败或删除仍须刷新最终分，不能只检查评测文件时间。
+        group["revision"] = hashlib.sha256(json.dumps(group, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    return grouped
+
+
 def history(run_id: str) -> list[dict[str, Any]]:
-    """返回一个批次的复核留证，最新记录在前。
+    """返回一个批次的复核留证，最新记录在前，调用方可独立修改副本。
 
     Args:
         run_id: 固定格式的原批次 ID。
@@ -230,18 +323,7 @@ def history(run_id: str) -> list[dict[str, Any]]:
         不包含题干、原回答或站点密钥的复核记录。
     """
     iq._path(run_id)
-    rows = []
-    with _LOCK:
-        for path in ROOT.glob("*.json"):
-            if not iq._VALID_ID.fullmatch(path.stem):
-                continue
-            try:
-                job = get(path.stem)
-            except (OSError, ValueError):
-                continue
-            if job and job["run_id"] == run_id:
-                rows.append(job)
-    return sorted(rows, key=lambda r: r["started_at"], reverse=True)
+    return copy.deepcopy(snapshot_index().get(run_id, {}).get("jobs", []))
 
 
 def automatic(run_id: str) -> dict[str, Any] | None:
