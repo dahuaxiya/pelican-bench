@@ -192,24 +192,29 @@ def _run_one(
     if not site:
         return _failure(site_name, model, "配置里找不到这个站点", 0.0)
 
+    execution = None
     try:
-        execution = None
         import official_channels
         channel = official_channels.adapter(site.get("base_url"))
         if channel:
             execution = channel.execution(model)
-        resp = llm.stream_chat(
-            site["base_url"],
-            site.get("api_key", ""),
-            model,
-            site.get("prompt") or cfg.get("prompt") or config.DEFAULT_PROMPT,
-            max_tokens=int(site.get("max_tokens") or cfg.get("max_tokens") or 8000),
-            temperature=float(cfg.get("temperature") or 0.7),
-            timeout=int(cfg.get("timeout_seconds") or 180),
-            thinking_mode=site.get("thinking_mode", "default"),
-        )
+        prompt = site.get("prompt") or cfg.get("prompt") or config.DEFAULT_PROMPT
+        timeout = int(cfg.get("timeout_seconds") or 180)
+        if site.get("base_url") == "codex://official":
+            import codex_stream
+            # 仅 SVG 入口切换；IQ 和工程评测保留各自的执行协议及计分规则。
+            # 无本站账号时适配器会回退隔离 exec，首字保持未知，不额外发请求。
+            resp = codex_stream.complete(model, prompt, timeout)
+            execution = {**execution, "transport": resp["transport"]}
+        else:
+            resp = llm.stream_chat(
+                site["base_url"], site.get("api_key", ""), model, prompt,
+                max_tokens=int(site.get("max_tokens") or cfg.get("max_tokens") or 8000),
+                temperature=float(cfg.get("temperature") or 0.7),
+                timeout=timeout, thinking_mode=site.get("thinking_mode", "default"),
+            )
     except llm.LLMError as exc:
-        return _failure(site_name, model, str(exc), time.perf_counter() - started)
+        return _failure(site_name, model, str(exc), time.perf_counter() - started, exc, execution)
     except Exception as exc:  # noqa: BLE001
         # 兜住未预期异常（比如解码问题），否则这条用例会变成"永远 pending"。
         return _failure(site_name, model, f"未预期错误：{type(exc).__name__}: {exc}", time.perf_counter() - started)
@@ -220,11 +225,21 @@ def _run_one(
     usage = resp["usage"]
     # 正常收完的空正文仍带有真实用量，保留这些字段才能区分额度耗尽和连接失败。
     error = resp.get("error") or ("" if svg else "响应里没有找到 <svg> 标签（模型没按格式输出）")
+    output_tps = _tps(usage["completion_tokens"], resp["total"] - resp["ttft"]) if resp["ttft"] is not None else None
+    output_tps_basis = "after_first_token"
+    if site.get("base_url") == "codex://official":
+        from codex_probe import performance_metrics
+        # Codex output_tokens 可能含推理与内部重试用量，不能除以首字之后的时间。
+        # 复用测速口径；短输出、缺失用量及失败响应不生成吞吐成绩。
+        metrics = performance_metrics(resp, time.perf_counter() - started, "performance")
+        output_tps = metrics.get("end_to_end_tokens_per_second")
+        output_tps_basis = "end_to_end"
 
     return {
         "site": site_name,
         "model": model,
         "execution": execution,
+        "transport_diagnostics": resp.get("transport_diagnostics"),
         "ok": bool(svg) and not error,
         # 请求本身成功但没抽到 SVG，属于"没遵循输出格式"，和网络失败要区分开。
         "error": error,
@@ -240,7 +255,8 @@ def _run_one(
         "completion_tokens": usage["completion_tokens"],
         "total_tokens": usage["total_tokens"],
         "tokens_estimated": usage["estimated"],
-        "output_tps": _tps(usage["completion_tokens"], resp["total"] - resp["ttft"]) if resp["ttft"] is not None else None,
+        "output_tps": output_tps,
+        "output_tps_basis": output_tps_basis,
         "cost": _cost(cfg, site, model, usage),
         "svg_bytes": len(svg.encode("utf-8")),
         # 动画标记必须在这里算并落进结果里：首页轮询走的是 snapshot()（不带 svg），
@@ -253,16 +269,19 @@ def _run_one(
     }
 
 
-def _failure(site_name: str, model: str, reason: str, elapsed: float) -> dict[str, Any]:
-    """构造失败结果，字段与成功结果保持一致，方便前端统一渲染表格。
+def _failure(site_name: str, model: str, reason: str, elapsed: float,
+             error: Exception | None = None, execution: dict | None = None) -> dict[str, Any]:
+    """构造失败结果；保留可信时间和诊断，但不把部分输出或用量算成成功成绩。
 
     @param site_name 站点名
     @param model 模型 id
     @param reason 失败原因，直接展示给用户
     @param elapsed 已耗时秒数
+    @param error 可选的原异常；仅接收 Codex 适配器定义的安全元数据
+    @param execution 已验证的执行条件，失败时同样保留以便排查
     @return 失败结果字典
     """
-    return {
+    result = {
         "site": site_name,
         "model": model,
         "ok": False,
@@ -287,6 +306,14 @@ def _failure(site_name: str, model: str, reason: str, elapsed: float) -> dict[st
         "svg": "",
         "raw": "",
     }
+    from codex_channel import CodexRequestError
+    if execution is not None:
+        result["execution"] = execution
+    if isinstance(error, CodexRequestError):
+        result.update(ttft=round(error.ttft, 3) if error.ttft is not None else None,
+                      chunks=error.chunks, transport_diagnostics=error.transport_diagnostics,
+                      execution={**(execution or {}), "transport": error.transport})
+    return result
 
 
 def _tps(completion_tokens: int | None, seconds: float) -> float | None:

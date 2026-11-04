@@ -259,7 +259,7 @@ def _median(values: list[float]) -> float:
 
 
 def _table(results: list[dict[str, Any]]) -> str:
-    """渲染指标表。
+    """渲染指标表；在官方吞吐旁标出口径，不把端到端速率混称纯输出速度。
 
     @param results 已排序的结果列表
     @return table 的 HTML
@@ -273,6 +273,9 @@ def _table(results: list[dict[str, Any]]) -> str:
         cost = r.get("cost") if isinstance(r.get("cost"), dict) else None
         est = " *" if r.get("tokens_estimated") else ""
         status = "成功" if r.get("ok") else (r.get("error") or "失败")
+        rate = _num(r.get("output_tps"), digits=1)
+        if r.get("output_tps") is not None and r.get("output_tps_basis") == "end_to_end":
+            rate += "（端到端）"
         rows.append(
             f'<tr class="{"" if r.get("ok") else "bad"}">'
             + _cell(r.get("site"))
@@ -280,7 +283,7 @@ def _table(results: list[dict[str, Any]]) -> str:
             + _cell(r.get("ttft"), _num(r.get("ttft")))
             + _cell(r.get("ttfb"), _num(r.get("ttfb")))
             + _cell(r.get("total"), _num(r.get("total")))
-            + _cell(r.get("output_tps"), _num(r.get("output_tps"), digits=1))
+            + _cell(r.get("output_tps"), rate)
             + _cell(r.get("prompt_tokens"), f'{r.get("prompt_tokens") or "-"}{est}')
             + _cell(r.get("completion_tokens"), f'{r.get("completion_tokens") or "-"}{est}')
             + _cell(cost["total"] if cost else None, f'{cost["total"]:.4f}' if cost else "-")

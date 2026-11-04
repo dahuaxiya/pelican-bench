@@ -1,4 +1,4 @@
-"""本站 ChatGPT 账号的性能测速：通过官方 app-server 观测正文增量，不读取凭据。"""
+"""本站 ChatGPT 账号的纯文本评测：通过官方 app-server 观测正文增量，不读取凭据。"""
 import json
 import os
 import selectors
@@ -41,7 +41,7 @@ def complete(model, prompt, timeout, cancel_event=None, on_diagnostic=None, on_o
 
     Args:
         model: 经过站点目录验证的模型名。
-        prompt: 性能测试的固定题干，仅通过 stdin 发送。
+        prompt: 调用方的评测题干，仅通过 stdin 发送。
         timeout: 包含启动、排队及内部重连的总时限，单位秒。
         cancel_event: 在初始化和生成期间都可生效的取消信号。
         on_diagnostic: 非阻塞回调，只接收脱敏错误类别和相对时间。
@@ -206,8 +206,13 @@ def complete(model, prompt, timeout, cancel_event=None, on_diagnostic=None, on_o
                                         on_output({"elapsed_seconds": ttft, "kind": "text_delta"})
                         elif method in ("item/started", "item/completed"):
                             item = params["item"]
-                            if item.get("type") not in ("userMessage", "agentMessage", "reasoning"):
-                                raise llm.LLMError("Codex 产生工具事件，本次不计分")
+                            item_type = channel._check_item(item, method)
+                            if item_type == "error":
+                                # 与 exec 一致：诊断通知不是工具使用，保留分类后等待终态。
+                                if method == "item/completed":
+                                    error_events += 1
+                                    report(item.get("message", ""), "item.error")
+                                continue
                             if method == "item/completed" and item["type"] == "agentMessage":
                                 text = item["text"]
                                 if not isinstance(text, str):
@@ -237,7 +242,11 @@ def complete(model, prompt, timeout, cancel_event=None, on_diagnostic=None, on_o
             raise
         except (llm.LLMError, OSError, ValueError, KeyError, TypeError) as exc:
             reason = str(exc) if isinstance(exc, llm.LLMError) else "Codex 流式事件格式异常或连接失败"
-            raise llm.LLMError(channel._failure_message(reason, diagnostics, error_events, errors)) from None
+            raise channel.CodexRequestError(
+                channel._failure_message(reason, diagnostics, error_events, errors),
+                "codex-app-server", {"capacity_detected": capacity_detected,
+                                     "error_events": error_events, "categories": list(diagnostics)},
+                ttft=ttft, chunks=chunks) from None
         finally:
             # app-server 是常驻协议，不会因一轮完成自行退出。只回收本次新建的进程组，
             # 完成、失败和取消均不触碰网站登录进程或用户桌面中的 Codex。
@@ -247,6 +256,7 @@ def complete(model, prompt, timeout, cancel_event=None, on_diagnostic=None, on_o
             process.stdout.close()
     return {"text": text, "completed": True, "truncated": False, "finish_reason": "turn/completed",
             "response_model": response_model, "ttft": ttft,
+            "ttfb": None, "total": response_seconds, "reasoning_chars": None,
             "error": None if text.strip() else "Codex 未返回答案", "transport": "codex-app-server",
             "transport_diagnostics": {"capacity_detected": capacity_detected,
                                       "error_events": error_events, "categories": diagnostics},
@@ -254,4 +264,4 @@ def complete(model, prompt, timeout, cancel_event=None, on_diagnostic=None, on_o
                             "response_seconds": response_seconds, "first_message_seconds": first_message},
             "usage": {"prompt_tokens": usage.get("inputTokens"), "completion_tokens": usage.get("outputTokens"),
                       "total_tokens": usage.get("totalTokens"), "reasoning_tokens": usage.get("reasoningOutputTokens"),
-                      "cached_tokens": usage.get("cachedInputTokens")}, "chunks": chunks}
+                      "cached_tokens": usage.get("cachedInputTokens"), "estimated": False}, "chunks": chunks}

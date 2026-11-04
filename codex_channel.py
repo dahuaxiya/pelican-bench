@@ -1,6 +1,7 @@
 """评测共用的官方 Codex 登录态渠道；认证完全交给 CLI，不读取认证文件。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -31,6 +32,60 @@ _DISABLED = (
     "view_image", "code_mode", "code_mode_host", "skill_search", "skill_mcp_dependency_install",
     "workspace_dependencies", "goals", "sleep_tool", "unbounded_connection_retries",
 )
+
+# 两种协议命名不同，但只有明确的工具事件才能被归类为工具使用。
+# 不依赖工具名、命令或参数识别，避免把不可信正文带入报告。
+_TOOL_ITEMS = frozenset((
+    "command_execution", "file_change", "mcp_tool_call", "web_search", "todo_list",
+    "collab_tool_call", "dynamic_tool_call", "image_generation", "image_view",
+    "commandExecution", "fileChange", "mcpToolCall", "webSearch", "dynamicToolCall",
+    "collabAgentToolCall", "subAgentActivity", "imageView", "imageGeneration",
+    "functionCallOutput", "sleep",
+))
+
+
+class CodexRequestError(llm.LLMError):
+    """请求失败时携带已观测元数据，不保留原始错误、工具参数或部分答案。"""
+
+    def __init__(self, message, transport, diagnostics, ttft=None, chunks=0):
+        """保存安全诊断快照；失败的首字观测不代表完整回答成功。
+
+        Args:
+            message: 已分类、可直接展示的错误说明，不能传上游原文。
+            transport: 内部固定的传输名称。
+            diagnostics: 已脱敏的错误计数、分类及容量证据。
+            ttft: 确实收到正文增量的时间；exec 通道必须为 None。
+            chunks: 本轮收到的非空正文增量数。
+        """
+        super().__init__(message)
+        self.transport = transport
+        self.transport_diagnostics = diagnostics
+        self.ttft = ttft
+        self.chunks = chunks
+
+
+def _check_item(item, event_name):
+    """校验纯文本请求中的 item；诊断通知不是工具，未知类型也不能放行。
+
+    Args:
+        item: 不可信的协议 item，只检查结构和类型，不执行其内容。
+        event_name: 调用方已匹配的固定事件名，决定使用哪种协议命名。
+    Returns:
+        已验证的类型。error 由调用方分类记录，是否成功仍以终态及正文为准。
+    """
+    if not isinstance(item, dict) or not isinstance(item.get("type"), str):
+        raise ValueError("invalid item")
+    kind = item["type"]
+    allowed = (("userMessage", "agentMessage", "reasoning", "plan", "contextCompaction", "error")
+               if "/" in event_name else ("agent_message", "reasoning", "error"))
+    if kind in allowed:
+        return kind
+    if kind in _TOOL_ITEMS:
+        raise llm.LLMError(f"Codex 返回工具事件，纯文本评测已中止 [tool]；事件 {event_name} / {kind}")
+    # 未知类型可能来自 CLI 升级，也可能包含敏感或恶意内容。只保存指纹供对照，
+    # 不直接回显它，更不能猜成工具事件或忽略后继续给出成功成绩。
+    fingerprint = hashlib.sha256(kind.encode("utf-8")).hexdigest()[:12]
+    raise llm.LLMError(f"Codex 返回不支持的事件类型 [protocol]；事件 {event_name} / unknown:{fingerprint}")
 
 
 def binary_path():
@@ -343,7 +398,7 @@ def complete(model, prompt, timeout, cancel_event=None, isolated=True, on_diagno
                 if cancel_event and cancel_event.is_set():
                     raise llm.LLMCancelled("已取消 Codex 请求")
                 if time.monotonic() - started > timeout:
-                    raise llm.LLMError(_failure_message("Codex 单题总时限已到", diagnostics, error_events, errors))
+                    raise llm.LLMError("Codex 单题总时限已到")
                 if os.fstat(errors.fileno()).st_size > _LIMIT:
                     raise llm.LLMError("Codex 诊断输出超限")
                 for key, _ in selector.select(0.1):
@@ -374,12 +429,17 @@ def complete(model, prompt, timeout, cancel_event=None, isolated=True, on_diagno
                                 and isinstance(item.get("message"), str)
                                 and item["message"].startswith("Code Mode is unavailable because code-mode host is disabled.")):
                             continue
-                        # CLI 升级或模型意外发起工具时拒绝计分，不能把工具辅助成绩冒充纯推理。
                         if kind in ("item.started", "item.updated", "item.completed"):
                             if finished:
                                 raise ValueError("item after terminal event")
-                            if item.get("type") not in ("agent_message", "reasoning"):
-                                raise llm.LLMError("Codex 产生工具事件，本题不计分")
+                            item_type = _check_item(item, kind)
+                            if item_type == "error":
+                                # item.error 是诊断，可能随后恢复；真正失败由 turn.failed、
+                                # 缺失终态或空答案判定。不能因通知而提前杀掉仍在恢复的请求。
+                                if kind == "item.completed":
+                                    error_events += 1
+                                    report_diagnostic(_diagnostic(item.get("message", "")), "item.error")
+                                continue
                             if kind == "item.completed" and item["type"] == "agent_message":
                                 report_output(item)
                                 text = item.get("text", "")
@@ -405,7 +465,7 @@ def complete(model, prompt, timeout, cancel_event=None, isolated=True, on_diagno
                             diagnostic = _diagnostic(event.get("error", event.get("message", "")))
                             report_diagnostic(diagnostic, kind)
                             if kind == "turn.failed":
-                                raise llm.LLMError(_failure_message("Codex 请求失败 (turn.failed)", diagnostics, error_events, errors))
+                                raise llm.LLMError("Codex 请求失败 (turn.failed)")
                             error_events += 1
                             if finished:
                                 raise ValueError("error after terminal event")
@@ -415,16 +475,22 @@ def complete(model, prompt, timeout, cancel_event=None, isolated=True, on_diagno
                 if cancel_event and cancel_event.is_set():
                     raise llm.LLMCancelled("已取消 Codex 请求")
                 if time.monotonic() - started > timeout:
-                    raise llm.LLMError(_failure_message("Codex 单题总时限已到", diagnostics, error_events, errors))
+                    raise llm.LLMError("Codex 单题总时限已到")
                 if os.fstat(errors.fileno()).st_size > _LIMIT:
                     raise llm.LLMError("Codex 诊断输出超限")
                 time.sleep(.05)
             check_capacity_stderr()
             if process.returncode or buffer.strip() or not finished:
                 reason = "Codex 未正常完成：" + ("事件流不完整" if buffer.strip() else "缺少 turn.completed" if not finished else "CLI 异常退出")
-                raise llm.LLMError(_failure_message(reason, diagnostics, error_events, errors, process.returncode))
-        except (ValueError, TypeError, subprocess.TimeoutExpired) as exc:
-            raise llm.LLMError(_failure_message("Codex 事件格式异常或进程退出超时", diagnostics, error_events, errors)) from exc
+                raise llm.LLMError(f"{reason}；退出码 {process.returncode}")
+        except llm.LLMCancelled:
+            raise
+        except (llm.LLMError, ValueError, TypeError, OSError, subprocess.TimeoutExpired) as exc:
+            reason = str(exc) if isinstance(exc, llm.LLMError) else "Codex 事件格式异常或进程退出超时"
+            raise CodexRequestError(
+                _failure_message(reason, diagnostics, error_events, errors), "codex-cli",
+                {"error_events": error_events, "categories": list(diagnostics),
+                 "capacity_detected": capacity_detected}) from None
         finally:
             selector.close()
             try:

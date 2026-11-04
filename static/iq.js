@@ -4,7 +4,7 @@
   const state = { ready: false, loading: false, picked: new Set(), sites: [], models: {}, suites: [],
     run: null, active: null, timer: null, busy: false, submitting: false, detailPair: null,
     detailKey: '', pending: null, retryPending: null, retrySubmitting: false, retryConfirmation: null, retryNotice: null,
-    visible: false, runRequest: 0,
+    visible: false, runRequest: 0, reviewRetries: new Map(),
     reviewBusy: false, judgeSite: '', judgeModel: '', judgeSaving: false, judgeLoading: false,
     rankData: null, rankRequest: 0, rankMode: 'all', rankView: 'bars', rankScope: { site: '', model: '' }, rankPage: 1, rankPageSize: 10 };
   const labels = { running: '运行中', stopping: '正在停止，关闭在途请求', completed: '已完成',
@@ -30,7 +30,7 @@
   }
 
   /**
-   * 调用同源 API；批次自身的 error 是可展示状态，不能误判为 HTTP 失败。
+   * 调用同源 API；批次自身的 error 是可展示状态，HTTP 失败另附状态码供重试区分。
    * @param {string} path 固定 API 路径
    * @param {Object} body 可选 JSON 请求体
    * @return {Promise<Object>} 已解析结果
@@ -38,7 +38,10 @@
   async function request(path, body) {
     const response = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined);
     const data = await response.json();
-    if (!response.ok) { throw new Error(data.error || 'HTTP ' + response.status); }
+    if (!response.ok) {
+      const failure = new Error(data.error || 'HTTP ' + response.status);
+      failure.httpStatus = response.status; throw failure;
+    }
     return data;
   }
 
@@ -679,7 +682,7 @@
     } else if (auto) {
       const reviewLabels = { queued: '排队中', running: '进行中', completed: '完成', partial: '部分完成',
         interrupted: '已中断', failed: '失败', unavailable: '无可用模型' };
-      node('iq-status').textContent += ' · 自动复核' + (reviewLabels[auto.status] || auto.status) +
+      node('iq-status').textContent += ' · ' + (auto.trigger === 'retry_failed' ? '复核重试' : '自动复核') + (reviewLabels[auto.status] || auto.status) +
         '：规则检查 ' + auto.rule_checked + ' 条，Agent ' + auto.done + ' / ' + auto.total;
       if (auto.failed) { node('iq-status').textContent += '，失败 ' + auto.failed; }
       if (auto.reused) { node('iq-status').textContent += '，复用 ' + auto.reused + ' 条复核'; }
@@ -691,6 +694,7 @@
     // 原地重试没有第二条历史记录；旧版子任务记录仍可通过这个入口回看。
     node('iq-retry-source').hidden = !run.retry || run.retry.mode === 'in_place';
     retryControl();
+    reviewRetryControl();
     // 原地重试保留旧失败结果，总完成数会继续是 840/840；进度条必须使用本轮的 done/count。
     node('iq-progress').hidden = false;
     node('iq-progress').max = run.retry ? run.retry.count : run.total;
@@ -699,7 +703,7 @@
     if (inReview && !['running', 'stopping'].includes(run.status)) {
       node('iq-progress').max = Math.max(1, auto.total);
       node('iq-progress').value = auto.done;
-      node('iq-progress').setAttribute('aria-label', '自动复核进度');
+      node('iq-progress').setAttribute('aria-label', auto.trigger === 'retry_failed' ? '复核重试进度' : '自动复核进度');
     }
     node('iq-export').disabled = false;
     node('iq-stop').hidden = !['running', 'stopping'].includes(run.status);
@@ -1085,6 +1089,112 @@
     retryFeedback(); node('iq-retry').focus({ preventScroll: true });
   }
 
+  /**
+   * 展示当前记录的整批复核入口与持久化进度；切换记录不丢失未确认的请求 ID。
+   * 已成功复核但判为答错也属于完成，不计入失败重试数量。
+   */
+  function reviewRetryControl() {
+    const run = state.run;
+    const button = node('iq-review-retry');
+    const confirm = node('iq-review-retry-confirm');
+    const feedback = node('iq-review-retry-feedback');
+    if (!run) { button.hidden = true; confirm.hidden = true; feedback.hidden = true; return; }
+    const batch = run.auto_review;
+    let local = state.reviewRetries.get(run.run_id);
+    // POST 回包丢失时，GET 中的同一请求 ID 能确认后台已经接收，不再重复提交。
+    if (local && !local.submitting && batch?.retry_request?.request_id === local.request.request_id) {
+      state.reviewRetries.delete(run.run_id); local = null;
+    }
+    const count = run.summary.reduce((sum, row) => sum + (row.final?.review_failed || 0), 0);
+    const active = ['queued', 'running'].includes(batch?.status);
+    const blocked = active || ['running', 'stopping'].includes(run.status) || state.retrySubmitting;
+    button.hidden = !count && !local && !(active && batch?.trigger === 'retry_failed');
+    button.disabled = blocked || Boolean(local?.submitting);
+    button.querySelector('span').textContent = local?.submitting ? '正在提交复核…' :
+      active && batch?.trigger === 'retry_failed' ? '复核重试中…' : '重试失败复核（' + count + '）';
+    confirm.hidden = !local?.confirming || blocked;
+    node('iq-review-retry-submit').disabled = blocked || Boolean(local?.submitting);
+    if (local?.confirming) {
+      node('iq-review-retry-confirm-description').textContent = '复核 ' + count + ' 条失败或中断的记录，使用 ' +
+        local.request.judge_site + ' / ' + local.request.judge_model +
+        '。保留已完成复核，不重新答题，结果更新到本批次。复核会消耗所选渠道额度。';
+    }
+    feedback.replaceChildren();
+    if (local?.notice) { feedback.append(element('p', local.notice)); }
+    else if (batch?.trigger === 'retry_failed') {
+      const label = active ? (batch.status === 'queued' ? '等待复核' : '复核重试中') :
+        ({ completed: '复核重试完成', partial: '复核重试部分完成', interrupted: '复核重试已中断' }[batch.status] || '复核重试失败');
+      feedback.append(element('strong', label + ' · ' + batch.done + ' / ' + batch.total));
+      feedback.append(element('p', batch.judge_site + ' / ' + batch.judge_model +
+        (active ? '' : ' · 完成 ' + batch.completed + ' 条，失败 ' + batch.failed + ' 条') +
+        (batch.error ? ' · ' + batch.error : '')));
+    }
+    feedback.hidden = !feedback.childElementCount;
+  }
+
+  /** 确认当前批次及复核模型；网络结果不明时沿用原参数，不能生成另一笔收费请求。 */
+  function confirmReviewRetry() {
+    const run = state.run;
+    if (!run || node('iq-review-retry').disabled) { return; }
+    let local = state.reviewRetries.get(run.run_id);
+    if (local?.rejected) { state.reviewRetries.delete(run.run_id); local = null; }
+    if (!local) {
+      const judgeSite = node('iq-judge-site').value || state.judgeSite;
+      const judgeModel = node('iq-judge-model').value || state.judgeModel;
+      if (!judgeSite || !judgeModel) { error('请先选择复核站点和模型'); return; }
+      local = { request: { run_id: run.run_id, request_id: crypto.randomUUID().replaceAll('-', ''),
+        judge_site: judgeSite, judge_model: judgeModel } };
+      state.reviewRetries.set(run.run_id, local);
+    }
+    local.confirming = true; reviewRetryControl();
+    node('iq-review-retry-confirm').scrollIntoView({ block: 'nearest' });
+    node('iq-review-retry-submit').focus({ preventScroll: true });
+  }
+
+  /**
+   * 提交一次显式复核重试，先反馈再轮询；提交期间禁用重复操作。
+   * 回包只更新同一批次，不能覆盖用户在等待期间切换到的其他记录。
+   * @return {Promise<void>} 请求和首次状态同步结束；失败保留请求 ID 供安全重发
+   */
+  async function submitReviewRetry() {
+    const runId = state.run?.run_id;
+    const local = state.reviewRetries.get(runId);
+    if (!local?.confirming || local.submitting || node('iq-review-retry-submit').disabled) { return; }
+    local.confirming = false; local.submitting = true; local.notice = '正在提交整批复核重试…';
+    reviewRetryControl(); error('');
+    try {
+      const batch = await request('/api/iq/review-retry', local.request);
+      state.reviewRetries.delete(runId);
+      if (state.run?.run_id === runId) {
+        // 先显示提交回包中的进度，废弃此前 GET，避免旧状态短暂覆盖新进度。
+        ++state.runRequest; clearTimeout(state.timer);
+        render({ ...state.run, auto_review: batch });
+        state.detailKey = ''; await refresh();
+      }
+    } catch (e) {
+      local.submitting = false;
+      // 明确的参数/状态拒绝没有创建任务，可重新选择模型；超时和断网仍有可能
+      // 已被接收，必须保留原请求 ID，不能把未知结果当作可以安全新建一轮。
+      local.rejected = e.httpStatus >= 400 && e.httpStatus < 500 && e.httpStatus !== 408;
+      local.notice = local.rejected ? '未能提交复核重试：' + e.message :
+        '未能确认复核重试是否提交：' + e.message + '。可再次点击重试，将使用同一请求标识，不重复提交。';
+      if (state.run?.run_id === runId) { reviewRetryControl(); await refresh(); }
+    } finally {
+      local.submitting = false;
+      if (state.run?.run_id === runId) { reviewRetryControl(); }
+    }
+  }
+
+  /** 取消未提交的确认可重新选择模型；已发送但回包不明的请求仍保留幂等标识。 */
+  function cancelReviewRetry() {
+    const runId = state.run?.run_id;
+    const local = state.reviewRetries.get(runId);
+    if (local?.submitting) { return; }
+    if (local?.notice && !local.rejected) { local.confirming = false; }
+    else { state.reviewRetries.delete(runId); }
+    reviewRetryControl(); node('iq-review-retry').focus({ preventScroll: true });
+  }
+
   /** 初始化本机元数据；榜单不等待画廊补全模型目录，也不发送付费请求。 */
   async function init() {
     if (state.ready) { await refresh(); return; }
@@ -1176,6 +1286,9 @@
     renderRanking();
   }));
   node('iq-retry').addEventListener('click', retryFailed);
+  node('iq-review-retry').addEventListener('click', confirmReviewRetry);
+  node('iq-review-retry-submit').addEventListener('click', submitReviewRetry);
+  node('iq-review-retry-cancel').addEventListener('click', cancelReviewRetry);
   node('iq-retry-confirm-submit').addEventListener('click', submitRetry);
   node('iq-retry-confirm-cancel').addEventListener('click', cancelRetryConfirmation);
   node('iq-retry-source').addEventListener('click', () => {

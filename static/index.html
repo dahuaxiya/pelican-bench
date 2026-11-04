@@ -11,6 +11,8 @@
 <link rel="stylesheet" href="/static/workspace.css">
 <link rel="stylesheet" href="/static/capacity.css">
 <link rel="stylesheet" href="/static/network.css">
+<link rel="stylesheet" href="/static/availability.css">
+<link rel="stylesheet" href="/static/health.css">
 </head>
 <body>
 <a class="skip-link" href="#main">跳到内容</a>
@@ -22,7 +24,9 @@
     <a class="tab" data-view="iq" href="#iq"><i data-lucide="brain" aria-hidden="true"></i><span>IQ 评测</span></a>
     <a class="tab" href="/static/engineering.html"><i data-lucide="code-xml" aria-hidden="true"></i><span>工程评测</span></a>
     <a class="tab" data-view="performance" href="#performance"><i data-lucide="gauge" aria-hidden="true"></i><span>性能测评</span></a>
+    <a class="tab" data-view="health" href="#health"><i data-lucide="heart-pulse" aria-hidden="true"></i><span>健康检查</span></a>
     <a class="tab" data-view="network" href="#network"><i data-lucide="network" aria-hidden="true"></i><span>节点测速</span></a>
+    <a class="tab" data-view="availability" href="#availability"><i data-lucide="activity" aria-hidden="true"></i><span>站点状态</span></a>
     <span class="nav-caption">工作区</span>
     <a class="tab" data-view="run" href="#run"><i data-lucide="play" aria-hidden="true"></i><span>SVG 跑批</span></a>
     <a class="tab" data-view="history" href="#history"><i data-lucide="history" aria-hidden="true"></i><span>运行历史</span></a>
@@ -32,6 +36,87 @@
 </header>
 
 <main id="main" tabindex="-1">
+  <section id="view-health" class="view hidden" aria-labelledby="health-title">
+    <div class="page-heading"><div><h2 id="health-title">健康检查</h2><p class="page-description">当前环境 · 官方模型可用性与速度</p></div><button id="health-refresh" data-icon="refresh-cw" data-icon-only="true" title="刷新记录和模型目录">刷新记录和模型目录</button></div>
+    <form id="health-form">
+      <div class="health-toolbar">
+        <label class="health-environment-label"><i data-lucide="map-pin" aria-hidden="true"></i><span class="health-sr-only">网络环境</span><select id="health-environment" aria-label="网络环境"><option value="other">其他环境</option><option value="company">公司</option><option value="home">家里</option></select></label>
+        <label class="health-model-label">模型<select id="health-model"><option value="">加载中…</option></select></label>
+        <div class="health-actions"><button id="health-start" type="submit" class="primary" data-icon="play">开始检测</button><button id="health-stop" type="button" data-icon="square" disabled hidden>停止</button></div>
+        <div class="health-toolbar-context"><span id="health-cost">1 次文字测速 + 1 次 SVG 生成，消耗订阅额度</span><span id="health-account" class="muted"></span></div>
+      </div>
+      <details class="health-advanced"><summary><i data-lucide="sliders-horizontal" aria-hidden="true"></i>检查设置<i data-lucide="chevron-down" aria-hidden="true"></i></summary><div class="health-controls">
+      <label>实测次数<select id="health-repeats"><option value="1">1 次</option><option value="2">2 次</option><option value="3">3 次</option></select></label>
+      <label class="inline toggle-label"><input id="health-model-check" type="checkbox" role="switch" checked>模型请求与测速</label>
+      <label class="inline toggle-label"><input id="health-svg-check" type="checkbox" role="switch" checked>SVG 生成</label>
+      <label class="inline toggle-label"><input id="health-diagnostics" type="checkbox" role="switch">附加本机诊断</label>
+      <span class="muted">medium · 每次最多 180 秒 · 串行</span>
+      </div></details>
+    </form>
+    <div id="health-live" class="health-live"><span class="health-live-dot" aria-hidden="true"></span><span id="health-progress" role="status">读取记录中</span><span id="health-elapsed" aria-hidden="true"></span></div>
+    <p id="health-error" class="run-error" role="alert" hidden></p>
+    <div class="bench-tabs health-tabs" role="tablist" aria-label="健康检查视图" data-panel-tabs="health">
+      <button id="health-check-tab" type="button" role="tab" data-panel="check" aria-controls="health-check-panel" aria-selected="true">检测结果</button>
+      <button id="health-compare-tab" type="button" role="tab" data-panel="compare" aria-controls="health-compare-panel" aria-selected="false" tabindex="-1">历史对比</button>
+    </div>
+    <section id="health-check-panel" class="health-panel" role="tabpanel" aria-labelledby="health-check-tab" data-panel-group="health" data-panel="check">
+      <div class="health-report-toolbar"><label class="health-record-label"><span class="health-sr-only">查看记录</span><select id="health-report" aria-label="查看记录"><option value="">暂无记录</option></select></label><button id="health-compare-current" type="button" data-icon="columns-2" disabled>对比此记录</button></div>
+      <div id="health-summary" class="health-summary" hidden>
+        <div class="health-summary-main"><div id="health-summary-icon" class="health-summary-icon" aria-hidden="true"></div><div><p id="health-report-meta" class="health-report-meta"></p><h3 id="health-result-title">等待检查</h3><p id="health-verdict" class="health-verdict"></p></div></div>
+        <div class="health-performance" aria-label="模型请求实测指标">
+          <div><span>请求成功</span><strong id="health-success-count">—</strong><small id="health-success-note">尚无结果</small></div>
+          <div><span>首字耗时</span><strong id="health-ttft">—</strong><small id="health-ttft-note">尚无结果</small></div>
+          <div><span title="真实输出 token 数 ÷ 完整响应耗时，包含等待及推理；不是纯生成速度">输出吞吐</span><strong id="health-speed">—</strong><small id="health-speed-note">尚无结果</small></div>
+          <div><span>总耗时</span><strong id="health-total">—</strong><small id="health-total-note">尚无结果</small></div>
+        </div>
+      </div>
+      <div id="health-next-step" class="health-next-step" hidden></div>
+      <div id="health-result" class="health-empty"><i data-lucide="clipboard-check" aria-hidden="true"></i><h3>暂无检测记录</h3></div>
+    </section>
+    <section id="health-compare-panel" class="health-panel" role="tabpanel" aria-labelledby="health-compare-tab" data-panel-group="health" data-panel="compare" hidden>
+      <div class="health-section-heading"><h3 id="health-compare-title">环境对比</h3><span id="health-count" class="muted"></span></div>
+      <div class="health-compare-pickers"><label>记录 A<select id="health-left"><option value="">选择记录</option></select></label><button id="health-swap" type="button" data-icon="arrow-left-right" data-icon-only="true" disabled>交换两条记录</button><label>记录 B<select id="health-right"><option value="">选择记录</option></select></label></div>
+      <div class="health-compare-options"><label class="inline toggle-label"><input id="health-differences" type="checkbox" role="switch" disabled>只看差异</label></div>
+      <p id="health-compare-note" class="muted">尚未选择两条记录</p><div id="health-comparison"><div class="health-empty"><i data-lucide="columns-2" aria-hidden="true"></i><h3>暂无对比结果</h3></div></div>
+    </section>
+  </section>
+  <section id="view-availability" class="view hidden" aria-labelledby="availability-title">
+    <div class="page-heading">
+      <div><h2 id="availability-title">站点状态</h2><p class="page-description">本机探测 · 历史可用性</p></div>
+      <button id="availability-check" data-icon="refresh-cw">刷新状态</button>
+    </div>
+    <div class="availability-overview" aria-label="站点状态概览">
+      <div><span>可用</span><strong id="availability-up">—</strong></div>
+      <div><span>失败</span><strong id="availability-down">—</strong></div>
+      <div><span>待检测 / 已过期</span><strong id="availability-unknown">—</strong></div>
+      <div class="availability-schedule"><label class="inline toggle-label"><input id="availability-enabled" type="checkbox" role="switch">自动监测</label><span id="availability-progress" role="status">加载中…</span></div>
+    </div>
+    <div class="availability-toolbar">
+      <div class="availability-ranges" role="group" aria-label="可用性时间范围">
+        <button data-availability-hours="24" aria-pressed="true">24 小时</button>
+        <button data-availability-hours="168" aria-pressed="false">7 天</button>
+        <button data-availability-hours="720" aria-pressed="false">30 天</button>
+      </div>
+      <div class="availability-legend"><span data-state="success">成功</span><span data-state="mixed">部分失败</span><span data-state="failure">失败</span><span data-state="unknown">未检测 / 未知</span></div>
+    </div>
+    <p id="availability-error" class="run-error" role="alert" hidden></p>
+    <div id="availability-list" aria-label="各站点可用性历史"></div>
+    <div id="availability-tooltip" role="tooltip" hidden></div>
+    <p id="availability-empty" class="empty-state" hidden>尚未配置站点。<a href="#settings">添加站点</a></p>
+    <details id="availability-settings" class="availability-settings">
+      <summary>监测设置 <span id="availability-settings-count" class="muted"></span></summary>
+      <form id="availability-form">
+        <p class="muted">每 5 分钟发送一次短请求；超时 45 秒。服务运行时持续检测，会使用所选站点额度。</p>
+        <div id="availability-site-settings"></div>
+        <div class="availability-settings-actions"><button type="submit" data-icon="save">保存设置</button><span id="availability-saved" role="status"></span></div>
+      </form>
+    </details>
+    <dialog id="availability-detail" aria-labelledby="availability-detail-title">
+      <div class="availability-detail-heading"><div><h3 id="availability-detail-title">检测记录</h3><p id="availability-detail-range" class="muted"></p></div><button id="availability-detail-close" data-icon="x" data-icon-only="true" aria-label="关闭检测记录">关闭</button></div>
+      <div id="availability-detail-records"></div>
+      <div class="availability-pagination"><button id="availability-prev" data-icon="chevron-left" data-icon-only="true">上一页</button><span id="availability-detail-page"></span><button id="availability-next" data-icon="chevron-right" data-icon-only="true">下一页</button></div>
+    </dialog>
+  </section>
   <!-- 每个组合展示最新成功出图，失败记录在历史版本中保留。 -->
   <section id="view-home" class="view">
     <div class="page-heading home-heading">
@@ -158,9 +243,19 @@
       <button id="iq-refresh" type="button" data-icon="refresh-cw" data-icon-only="true">刷新</button>
       <button id="iq-export" type="button" data-icon="download" disabled>导出 JSON</button>
       <button id="iq-retry" type="button" data-icon="refresh-cw" hidden><span>重试接口失败</span></button>
+      <button id="iq-review-retry" type="button" data-icon="refresh-cw" hidden><span>重试失败复核</span></button>
       <button id="iq-retry-source" type="button" data-icon="arrow-left" hidden>原始记录</button>
       <button id="iq-stop" type="button" class="danger" hidden>停止</button>
     </div></div>
+    <div id="iq-review-retry-confirm" class="iq-retry-confirm" role="group" aria-labelledby="iq-review-retry-confirm-title" hidden>
+      <strong id="iq-review-retry-confirm-title">整批重试失败复核</strong>
+      <p id="iq-review-retry-confirm-description"></p>
+      <div class="iq-actions">
+        <button id="iq-review-retry-submit" type="button" class="primary" data-icon="play">确认复核</button>
+        <button id="iq-review-retry-cancel" type="button">取消</button>
+      </div>
+    </div>
+    <div id="iq-review-retry-feedback" class="iq-retry-feedback" role="status" aria-live="polite" hidden></div>
     <div id="iq-retry-confirm" class="iq-retry-confirm" role="group" aria-labelledby="iq-retry-confirm-title" hidden>
       <strong id="iq-retry-confirm-title">确认重试接口失败</strong>
       <p id="iq-retry-confirm-description"></p>
@@ -318,6 +413,8 @@
 <script src="/static/capacity.js"></script>
 <script src="/static/performance-history.js"></script>
 <script src="/static/network.js"></script>
+<script src="/static/availability.js"></script>
+<script src="/static/health.js"></script>
 <script src="/static/chatgpt.js"></script>
 <script src="/static/app.js"></script>
 <script src="/static/iq.js"></script>

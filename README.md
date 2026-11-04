@@ -30,7 +30,7 @@ pelican-bench --data-dir ./my-bench-data
 也保留 npm 安装入口，需要 Node.js 20+ 和 Python 3.10+。npm 注册表尚未发布，请使用 GitHub Release 提供的安装包：
 
 ```sh
-npm install -g https://github.com/dahuaxiya/pelican-bench/releases/download/v0.5.0/pelican-bench-0.5.0.tgz
+npm install -g https://github.com/dahuaxiya/pelican-bench/releases/download/v0.6.0/pelican-bench-0.6.0.tgz
 pelican-bench
 ```
 
@@ -149,6 +149,15 @@ pelican-bench vpn recover
 点击排名旁的「切换最优节点」，会采用当前展示批次中全部测试成功且指标完整的第一名。`vpn apply` 默认使用当前配置最新完成的批次，也可指定批次 ID。切换后重新核对节点并验证官方握手，不额外生成文本；成功才保留新选择，失败恢复点击前的节点。历史排名不代表当前速度，网络变化后应重新测速。切换影响新连接，已有长连接继续使用原连接。
 
 握手目标为 `chatgpt.com/backend-api/codex/responses`，成功要求 HTTP 101 和完整 WebSocket 升级校验；普通 HTTPS 成功不算。401、429、5xx 会停止握手测试整批，403 作为该节点的拒绝记录。模型实测遇到认证、额度、限流或容量错误会停止，避免把上游故障当成节点速度。少量样本不能证明长期稳定或所有模型都可用；模型实测结果也不能全部归因于 VPN。
+
+## 站点状态与健康检查
+
+网页导航新增两个独立页面：
+
+- **站点状态**：按站点查看最近 24 小时、7 天或 30 天的可用率与检测记录，并区分上游返回、估算和缺失的 token 用量。监测默认关闭；选好站点并开启后，每轮至少间隔 5 分钟，实际发送模型请求，会使用渠道额度。重启保留设置与历史，不补发遗漏的检测。
+- **健康检查**：使用本站官方 Codex 渠道进行文字测速和可选 SVG 生成，也可附加本机 CLI 诊断。结果区分容量、额度和连接问题，保留历史；打开页面不会自动进行模型实测。本机诊断通过不代表模型容量充足。
+
+IQ 评测支持批量重试失败或中断的复核，保留原答案和已完成复核，不重新答题。官方 Codex SVG 评测保留首字和错误诊断；其吞吐显示为端到端速率，不等同于首字之后的生成速度。
 
 ## 数据与升级
 

@@ -48,8 +48,15 @@ for line in sys.stdin:
         note("item/agentMessage/delta", delta="OTHER", threadId="unrelated")
         note("item/agentMessage/delta", delta="OTHER", turnId="unrelated")
         note("item/agentMessage/delta", delta="  ")
-        if scenario in ("capacity", "failure"):
+        if scenario in ("capacity", "failure", "late_failure"):
             note("error", error={"message": "HTTP 503 Selected model is at capacity. sk-test-secret"})
+        if scenario == "item_error":
+            note("item/completed", item={"type": "error", "message": "HTTP 503 Selected model is at capacity. sk-test-secret"})
+        if scenario == "metadata":
+            note("item/completed", item={"type": "plan", "text": "Plan"})
+            note("item/completed", item={"type": "contextCompaction"})
+        if scenario == "unknown":
+            note("item/completed", item={"type": "sk-test-secret"})
         if scenario == "tool":
             note("item/started", item={"id": "tool", "type": "commandExecution"})
         if scenario == "approval":
@@ -60,6 +67,8 @@ for line in sys.stdin:
         if scenario != "no_delta":
             note("item/agentMessage/delta", delta="Hello", itemId="answer")
             note("item/agentMessage/delta", delta=" world", itemId="answer")
+        if scenario == "late_failure":
+            note("turn/completed", turn={"id": "turn", "status": "failed"})
         if scenario == "hang_turn":
             time.sleep(10)
         time.sleep(.08)
@@ -142,6 +151,34 @@ class StreamTests(unittest.TestCase):
         result = self.run_sample("capacity")
         self.assertTrue(result["transport_diagnostics"]["capacity_detected"])
         self.assertNotIn("sk-test-secret", json.dumps(result))
+
+    def test_error_items_are_diagnostics_and_metadata_is_not_a_tool(self):
+        """可恢复错误和协议元数据不误判工具；诊断仍随成功结果保存。"""
+        result = self.run_sample("item_error")
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["transport_diagnostics"]["error_events"], 1)
+        self.assertTrue(result["transport_diagnostics"]["capacity_detected"])
+        self.assertNotIn("sk-test-secret", json.dumps(result))
+        self.assertTrue(self.run_sample("metadata")["completed"])
+
+    def test_unknown_and_tool_events_have_distinct_safe_failures(self):
+        """未知类型不冒充工具调用，真实工具仍拒收，原始类型内容不能泄漏。"""
+        for scenario, category in (("unknown", "[protocol]"), ("tool", "[tool]")):
+            with self.subTest(scenario=scenario), self.assertRaises(codex_stream.channel.CodexRequestError) as raised:
+                self.run_sample(scenario)
+            self.assertIn(category, str(raised.exception))
+            self.assertIn("item/", str(raised.exception))
+            self.assertNotIn("sk-test-secret", str(raised.exception))
+
+    def test_failure_preserves_observed_ttft_without_claiming_success(self):
+        """收到正文后失败仍可诊断首字，但没有成功答案或可计分用量。"""
+        with self.assertRaises(codex_stream.channel.CodexRequestError) as raised:
+            self.run_sample("late_failure")
+        error = raised.exception
+        self.assertIsNotNone(error.ttft)
+        self.assertEqual(error.chunks, 2)
+        self.assertTrue(error.transport_diagnostics["capacity_detected"])
+        self.assertNotIn("Hello", str(error))
 
     def test_failure_incomplete_tools_and_invalid_events_never_succeed(self):
         """失败终态、EOF、工具调用及格式异常都不能把部分回答当成功结果。"""

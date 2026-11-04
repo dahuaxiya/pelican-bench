@@ -454,6 +454,80 @@ def schedule_run(cfg: dict[str, Any], run: dict[str, Any]) -> dict[str, Any] | N
     return automatic(run["run_id"])
 
 
+def retry_failed(cfg: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    """显式补复核当前批次的失败项，原答题记录和成功复核保持不变。
+
+    Args:
+        cfg: 当前私有站点配置，只在工作线程中使用凭据。
+        request: 原评测 ID、幂等请求 ID、确认过的评委站点与模型。
+    Returns:
+        独立的本轮复核进度，仍关联原 run_id，不创建新的评测记录。
+        同一请求跨重启只读取已有结果，不重新消耗额度。
+    """
+    global _AUTO_THREAD
+    if not isinstance(request, dict) or set(request) != {"run_id", "request_id", "judge_site", "judge_model"}:
+        raise ValueError("复核重试只接受原评测 ID、请求 ID 和复核站点、模型")
+    iq._path(request["run_id"])
+    iq._path(request["request_id"])
+    if (not isinstance(request["judge_site"], str) or not isinstance(request["judge_model"], str)
+            or not request["judge_model"].strip() or len(request["judge_model"]) > 200):
+        raise ValueError("请选择有效的复核站点和模型")
+    batch_id = hashlib.sha256(("review-retry:" + request["request_id"]).encode()).hexdigest()[:32]
+    signature = {key: request[key] for key in ("run_id", "request_id", "judge_site", "judge_model")}
+    # 先读取原题，再持复核锁；IQ 的摘要路径也会读取复核，不能反向持锁造成死锁。
+    run = iq.get(request["run_id"], full=True, reviews=False)
+    if not run:
+        raise ValueError("找不到原评测")
+    with _AUTO_CONDITION:
+        previous = _BATCHES.get(batch_id) or _load_batch(_batch_path(batch_id))
+        if previous:
+            if previous.get("retry_request") != signature:
+                raise ValueError("同一复核重试请求 ID 不能修改参数")
+            result = copy.deepcopy({k: v for k, v in previous.items() if k != "job_ids"})
+            if batch_id not in _BATCHES and result["status"] in ("queued", "running"):
+                result.update(status="interrupted", error="服务重启，复核重试未重新发送")
+            return result
+        if run["status"] in ("running", "stopping"):
+            raise ValueError("请等答题结束后再重试复核")
+        current = snapshot_index().get(run["run_id"], {})
+        if (current.get("automatic") or {}).get("status") in ("queued", "running") or any(
+                job["status"] == "running" for job in current.get("jobs", [])):
+            raise ValueError("该批次正在复核，请等待本轮结束")
+        annotate(run, current)
+        selected = [row for row in run["results"]
+                    if row["final"].get("review_status") in ("failed", "interrupted")]
+        if not selected:
+            raise ValueError("当前批次没有失败或中断的复核项")
+        judge = next((s for s in cfg.get("sites", []) if s.get("name") == request["judge_site"]), None)
+        if not judge or not judge.get("base_url") or not judge.get("ready", True):
+            raise ValueError("复核站点不可用，请检查复核设置")
+        questions = {q["id"]: q for q in run["questions"]}
+        requests = []
+        for row in selected:
+            identity = {key: row[key] for key in ("site", "model", "question_id", "repeat")}
+            # 新轮次生成新的复核尝试 ID；HTTP 重发复用 batch_id，既能重试失败，
+            # 又不覆盖之前的错误留证或重复重试已经完成的回答。
+            job_id = hashlib.sha256((batch_id + json.dumps(identity, sort_keys=True)).encode()).hexdigest()[:32]
+            requests.append({"request_id": job_id, "run_id": run["run_id"], **identity,
+                             "judge_site": request["judge_site"], "judge_model": request["judge_model"],
+                             "source_sha256": source_hash(questions[row["question_id"]], row["raw"])})
+        batch = {"id": batch_id, "run_id": run["run_id"], "trigger": "retry_failed",
+                 "retry_request": signature, "started_at": time.time(), "finished_at": None,
+                 "status": "queued", "rule_checked": len(run["results"]), "pending": len(selected),
+                 "total": len(selected), "done": 0, "completed": 0, "failed": 0, "deferred": 0,
+                 "limit": None, "reused": 0, "version": VERSION, "normalization_version": iq_scoring.VERSION,
+                 "error": "", "job_ids": [], "advisory": False,
+                 "judge_site": request["judge_site"], "judge_model": request["judge_model"]}
+        _save_batch(batch)
+        _BATCHES[batch_id] = batch
+        _AUTO_QUEUE.append({"batch_id": batch_id, "cfg": copy.deepcopy(cfg), "requests": requests, "failed_only": True})
+        if _AUTO_THREAD is None or not _AUTO_THREAD.is_alive():
+            _AUTO_THREAD = threading.Thread(target=_dispatch_auto, name="iq-auto-review", daemon=True)
+            _AUTO_THREAD.start()
+        _AUTO_CONDITION.notify_all()
+        return copy.deepcopy({k: v for k, v in batch.items() if k != "job_ids"})
+
+
 def _dispatch_auto() -> None:
     """按全局复核上限提交任务，等待时释放锁，原评测线程不参与等待。"""
     global _AUTO_THREAD
@@ -471,7 +545,8 @@ def _dispatch_auto() -> None:
                 _save_batch(batch)
             for request in work["requests"]:
                 try:
-                    job = start(work["cfg"], request, auto_batch_id=batch["id"], expected_source=request["source_sha256"])
+                    job = start(work["cfg"], request, auto_batch_id=batch["id"], expected_source=request["source_sha256"],
+                                failed_only=work.get("failed_only", False))
                     with _AUTO_CONDITION:
                         batch["job_ids"].append(job["id"])
                         if job.get("auto_batch_id") != batch["id"]:
@@ -558,7 +633,7 @@ def _review_candidate(question: dict[str, Any], text: str) -> str:
 
 
 def start(cfg: dict[str, Any], request: dict[str, Any], *, auto_batch_id: str | None = None,
-          expected_source: str | None = None) -> dict[str, Any]:
+          expected_source: str | None = None, failed_only: bool = False) -> dict[str, Any]:
     """幂等启动一次 agent 复核，手动和自动任务共用全局 200 个并发槽位。
 
     Args:
@@ -566,6 +641,7 @@ def start(cfg: dict[str, Any], request: dict[str, Any], *, auto_batch_id: str | 
         request: 批次、原结果身份、复核模型和请求 ID，不接受原文或上游 URL。
         auto_batch_id: 内部自动复核批次标识，HTTP 调用不能设置；自动任务等待空闲槽位。
         expected_source: 排队时的原文哈希，防止原地重试后复核错版本的答案。
+        failed_only: 整批补复核在提交前再次检查，复用排队期间已完成或开始的逐题复核。
     Returns:
         已持久化的任务状态；重复 ID 且参数相同返回已有任务。
     """
@@ -608,6 +684,17 @@ def start(cfg: dict[str, Any], request: dict[str, Any], *, auto_batch_id: str | 
             if any(previous.get(k) != v for k, v in signature.items()):
                 raise ValueError("同一复核请求 ID 不能修改参数")
             return previous
+        # 等待名额时会释放锁；恢复后必须再查原项，避免同时进行的逐题复核
+        # 已经完成，却仍为批量补复核发送第二次收费请求。
+        if auto_batch_id:
+            _AUTO_CONDITION.wait_for(lambda: len(_ACTIVE) < REVIEW_MAX_CONCURRENCY)
+        if failed_only:
+            latest = next((prior for prior in history(run["run_id"])
+                           if prior.get("version") == VERSION and not prior.get("advisory", True)
+                           and prior.get("normalization_version") == iq_scoring.VERSION
+                           and iq._cell(prior) == iq._cell(row) and prior.get("source_sha256") == source_hash), None)
+            if latest and latest["status"] in ("completed", "running"):
+                return latest
         # 自动收尾可以重用已成功的复核；手动入口也不能再给已判对答案收费。
         for prior in history(run["run_id"]):
             if (prior.get("version") == VERSION and not prior.get("advisory", True)
@@ -615,10 +702,6 @@ def start(cfg: dict[str, Any], request: dict[str, Any], *, auto_batch_id: str | 
                     and iq._cell(prior) == iq._cell(row) and prior.get("source_sha256") == source_hash
                     and prior["status"] == "completed" and prior.get("suggestion", {}).get("score") == 1):
                 return prior
-        if auto_batch_id:
-            # 等待和登记必须使用同一把锁。先在 dispatcher 检查再到此处登记，
-            # 手动复核可能抢占槽位，导致自动任务被误记为失败；Condition 等待会释放锁。
-            _AUTO_CONDITION.wait_for(lambda: len(_ACTIVE) < REVIEW_MAX_CONCURRENCY)
         if len(_ACTIVE) >= REVIEW_MAX_CONCURRENCY:
             raise ValueError(f"已有 {REVIEW_MAX_CONCURRENCY} 个评分 agent 正在复核，请稍后再试")
         job = {"id": job_id, **signature, "started_at": time.time(), "finished_at": None,

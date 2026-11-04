@@ -39,6 +39,8 @@ import codex_auth
 import kimi_channel
 import codex_probe
 import network_probe
+import availability
+import health_check
 
 STATIC_DIR = os.path.join(config.SOURCE_ROOT, "static")
 
@@ -78,8 +80,9 @@ def _model_catalog(site, refresh=False):
 
 
 def _evaluation_busy():
-    """只看内存中仍活动的任务及复核队列，避免磁盘历史被当成在途工作。"""
-    if codex_probe.manager.busy() or network_probe.manager.busy():
+    """检查在途评测与监测，避免账号切换或节点切换干扰已发出的请求。"""
+    if (codex_probe.manager.busy() or network_probe.manager.busy()
+            or availability.manager.busy() or health_check.manager.busy()):
         return True
     with iq._LOCK:
         if any(run.data.get("status") in ("running", "stopping") for run in iq._RUNS.values()):
@@ -164,7 +167,7 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- 路由 ----------
 
     def do_GET(self) -> None:  # noqa: N802
-        """处理 GET；CLI 请求核对实例，评测历史按固定 ID 访问，不含凭据。"""
+        """读取本机状态及有界历史；站点监测结果不包含连接配置或原始响应。"""
         if not self._host_ok():
             self._json({"error": "只允许通过 127.0.0.1 访问"}, 403)
             return
@@ -199,6 +202,22 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/runtime/status":
                 self._json({"state": "stopping" if getattr(self.server, "stopping", False) else "running",
                             "busy": _evaluation_busy()})
+            elif path == "/api/availability":
+                self._json(availability.manager.snapshot(int(query.get("hours", ["24"])[0])))
+            elif path == "/api/health-check":
+                self._json(health_check.manager.snapshot())
+            elif path == "/api/health-check/history":
+                self._json(health_check.manager.history())
+            elif path == "/api/health-check/models":
+                catalog = health_check.codex_channel.catalog()
+                self._json({key: catalog.get(key) for key in ("ready", "models", "auth_source", "cli_version")})
+            elif path.startswith("/api/health-check/run/"):
+                data = health_check.manager.get(path.rsplit("/", 1)[1])
+                self._json(data or {"error": "检查记录不存在"}, 200 if data else 404)
+            elif path == "/api/availability/history":
+                self._json(availability.manager.history(
+                    query.get("site", [""])[0], float(query.get("start", ["0"])[0]),
+                    float(query.get("end", ["0"])[0]), int(query.get("page", ["1"])[0])))
             elif path == "/api/network/config":
                 self._json(network_probe.manager.settings())
             elif path == "/api/network/models":
@@ -277,7 +296,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         """创建与账号切换保持互斥；取消已有任务不等待无关的控制器或登录网络请求。"""
         if urlparse(self.path).path in {"/api/probe/cancel", "/api/chatgpt/probe/cancel",
-                                       "/api/iq/cancel", "/api/swe/cancel", "/api/network/cancel"}:
+                                       "/api/iq/cancel", "/api/swe/cancel", "/api/network/cancel", "/api/health-check/cancel"}:
             # Cancel operations only signal existing workers, never create work or change
             # accounts. Each manager retains its own state lock and all origin checks.
             self._dispatch_post()
@@ -286,7 +305,7 @@ class Handler(BaseHTTPRequestHandler):
             self._dispatch_post()
 
     def _dispatch_post(self) -> None:
-        """核对实例、同源和停机状态；创建任务的调用方持有共享操作锁。"""
+        """核对实例、同源和停机状态；监测启动和账号操作共用锁以避免交叉使用账号。"""
         if not self._host_ok():
             self._json({"error": "只允许通过 127.0.0.1 访问"}, 403)
             return
@@ -299,7 +318,7 @@ class Handler(BaseHTTPRequestHandler):
             if getattr(self.server, "stopping", False):
                 self._json({"error": "服务正在停止，不再接受操作"}, 503)
                 return
-            if path in ("/api/run", "/api/config", "/api/probe", "/api/probe/cancel", "/api/cli/site", "/api/runtime/stop") or path.startswith(("/api/chatgpt/", "/api/kimi/", "/api/network/")):
+            if path in ("/api/run", "/api/config", "/api/probe", "/api/probe/cancel", "/api/cli/site", "/api/runtime/stop") or path.startswith(("/api/chatgpt/", "/api/kimi/", "/api/network/", "/api/availability/", "/api/health-check/")):
                 # SVG 与设置同样可触发账号用量或改变路由，不能允许第三方网页借本机登录态代发。
                 origin = self.headers.get("Origin")
                 if origin and origin != "http://" + self.headers.get("Host", ""):
@@ -311,9 +330,23 @@ class Handler(BaseHTTPRequestHandler):
             # A node benchmark temporarily changes shared networking. This check is
             # inside the creation lock, so no new evaluation can slip past it.
             network_conflicts = {"/api/run", "/api/probe", "/api/chatgpt/probe", "/api/iq/run",
-                                 "/api/iq/retry", "/api/iq/review", "/api/iq/review-run", "/api/swe/run"}
+                                 "/api/iq/retry", "/api/iq/review", "/api/iq/review-run", "/api/iq/review-retry", "/api/swe/run"}
             if path in network_conflicts and network_probe.manager.busy():
                 self._json({"error": "节点测速或切换正在进行，请等待结束后再开始评测"}, 409)
+                return
+            if path in network_conflicts and health_check.manager.busy():
+                self._json({"error": "健康检查正在进行，请等待结束，避免并发请求影响结果"}, 409)
+                return
+            if path.startswith("/api/health-check/"):
+                self._api_health_check(path)
+                return
+            if path == "/api/availability/settings":
+                self._json(availability.manager.configure(self._read_json()))
+                return
+            if path == "/api/availability/check":
+                if self._read_json():
+                    raise ValueError("立即检测不接受额外参数")
+                self._json(availability.manager.check(), 202)
                 return
             if path.startswith("/api/network/"):
                 self._api_network(path)
@@ -391,7 +424,7 @@ class Handler(BaseHTTPRequestHandler):
                 with codex_channel._LOCK:
                     codex_channel._CACHE = None
                 self._json(result)
-            elif path in ("/api/iq/run", "/api/iq/cancel", "/api/iq/review", "/api/iq/review-run", "/api/iq/retry", "/api/iq/review-settings"):
+            elif path in ("/api/iq/run", "/api/iq/cancel", "/api/iq/review", "/api/iq/review-run", "/api/iq/review-retry", "/api/iq/retry", "/api/iq/review-settings"):
                 self._api_iq_post(path)
             elif path in ("/api/swe/run", "/api/swe/cancel"):
                 self._api_iq_post(path)
@@ -407,6 +440,27 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
 
     # ---------- 具体处理 ----------
+
+    def _api_health_check(self, path):
+        """在共用操作锁下启动低干扰检查；同一 ID 重发只读取，不重复使用额度。
+
+        Args:
+            path: 已通过同源与 JSON 校验的固定路由；取消不等待启动锁。
+        """
+        data = self._read_json()
+        if not isinstance(data, dict):
+            raise ValueError("检查参数必须是 JSON 对象")
+        manager = health_check.manager
+        if path == "/api/health-check/start":
+            previous = manager.get(data.get("request_id"))
+            if not previous and (_evaluation_busy() or codex_auth.manager.pending or kimi_channel.manager.pending):
+                self._json({"error": "请先结束当前评测、监测或账号登录，再开始健康检查"}, 409)
+                return
+            self._json(manager.start(data), 202)
+        elif path == "/api/health-check/cancel" and set(data) == {"run_id"} and isinstance(data["run_id"], str):
+            self._json(manager.cancel(data["run_id"]))
+        else:
+            raise ValueError("不支持的健康检查操作")
 
     def _api_network(self, path):
         """Serialize local tests and explicit verified switches with evaluation creation."""
@@ -471,7 +525,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"sites": config.public_config(cfg)["sites"]})
 
     def _api_iq_post(self, path: str) -> None:
-        """处理评测和复核设置，拒绝跨源网页或表单代发请求。
+        """处理评测、逐题与整批复核，拒绝跨源网页或表单代发收费请求。
 
         @param path 已匹配的固定评测路由，不接受前端指定上游地址或凭据
         """
@@ -487,6 +541,8 @@ class Handler(BaseHTTPRequestHandler):
             result = config.save_review_settings(data)
         elif path == "/api/iq/review":
             result = iq_review.start(config.load(), data)
+        elif path == "/api/iq/review-retry":
+            result = iq_review.retry_failed(config.load(), data)
         elif path == "/api/iq/review-run":
             # 升级前已结束的记录也能按同一规则复核；读取历史不触发收费。
             # schedule_run 对同一轮幂等，拒绝运行中的记录，不再次请求被测模型。
@@ -682,7 +738,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main(argv=None, on_listening=None, instance_id=None, control_token=None) -> None:
-    """绑定回环端口后恢复历史再提供服务，供源码入口及 npm 启动器共用。
+    """绑定回环端口后恢复历史并启动监测，退出时取消请求，供源码及 npm 共用。
 
     Args:
         argv: 命令行参数列表；None 时读取进程参数，端口 0 由系统分配。
@@ -715,6 +771,11 @@ def main(argv=None, on_listening=None, instance_id=None, control_token=None) -> 
     server.stopping = False
     codex_probe.manager.restore_history()
     network_probe.manager.restore_history()
+    # Only the process that owns the port may recover history and schedule probes.
+    # Route switching defers monitoring without recording a provider failure.
+    availability.manager.start_service(_ACCOUNT_ACTION_LOCK,
+        lambda: server.stopping or network_probe.manager.busy() or health_check.manager.busy()
+        or bool(codex_auth.manager.pending) or bool(kimi_channel.manager.pending))
     server.engineering_port = args.engineering_port
     url = f"http://127.0.0.1:{server.server_port}/"
     if on_listening:
@@ -727,6 +788,8 @@ def main(argv=None, on_listening=None, instance_id=None, control_token=None) -> 
     except KeyboardInterrupt:
         print("\n停了")
     finally:
+        health_check.manager.close()
+        availability.manager.close()
         network_probe.manager.close()
         codex_probe.manager.cancel()
         server.server_close()
