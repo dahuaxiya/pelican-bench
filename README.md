@@ -30,7 +30,7 @@ pelican-bench --data-dir ./my-bench-data
 也保留 npm 安装入口，需要 Node.js 20+ 和 Python 3.10+。npm 注册表尚未发布，请使用 GitHub Release 提供的安装包：
 
 ```sh
-npm install -g https://github.com/dahuaxiya/pelican-bench/releases/download/v0.6.0/pelican-bench-0.6.0.tgz
+npm install -g https://github.com/dahuaxiya/pelican-bench/releases/download/v0.6.1/pelican-bench-0.6.1.tgz
 pelican-bench
 ```
 
